@@ -21,7 +21,7 @@ use jj_lib::repo_path::{RepoPathBuf, RepoPathComponent, RepoPathComponentBuf};
 use jj_lib::settings::UserSettings;
 use rustc_hash::FxHashMap;
 use slab::Slab;
-use tracing::trace;
+use tracing::{error, trace};
 
 #[derive(Parser)]
 #[command(version)]
@@ -255,15 +255,23 @@ impl InodeTable {
             };
             path = state.path.clone();
         }
-        // TODO: Logging
-        let mut file = repo.store().read_file(&path, &id).await.map_err(|_| EIO)?;
+        let mut file = repo.store().read_file(&path, &id).await.map_err(|e| {
+            error!("opening {path:?}: {:#}", e);
+            EIO
+        })?;
         // Brute-force seek
         let mut scratch = [0; 4096];
         while offset > 0 {
             let n = Ord::min(offset, scratch.len() as u64) as usize;
-            offset -= file.read(&mut scratch[..n]).await.map_err(|_| EIO)? as u64;
+            offset -= file.read(&mut scratch[..n]).await.map_err(|e| {
+                error!("reading {path:?}: {:#}", e);
+                EIO
+            })? as u64;
         }
-        let n = file.read(buf).await.map_err(|_| EIO)?;
+        let n = file.read(buf).await.map_err(|e| {
+            error!("reading {path:?}: {:#}", e);
+            EIO
+        })?;
         Ok(n)
     }
 
@@ -279,7 +287,10 @@ impl InodeTable {
                 .store()
                 .get_file_metadata(&path, &id)
                 .await
-                .map_err(|_| EIO)?;
+                .map_err(|e| {
+                    error!("fetching metadata for {path:?}: {:#}", e);
+                    EIO
+                })?;
             size = meta.size;
         };
         Ok(FileAttr {
@@ -330,9 +341,12 @@ impl InodeTable {
         }
         let tree = repo
             .store()
-            .get_tree(dir_path, &tree_id)
+            .get_tree(dir_path.clone(), &tree_id)
             .await
-            .map_err(|_| EIO)?;
+            .map_err(|e| {
+                error!("opening directory {dir_path:?}: {:#}", e);
+                EIO
+            })?;
         let iter = tree.entries_non_recursive();
         if let Some(hint) = iter.size_hint().1 {
             entries.reserve_exact(hint);
@@ -404,9 +418,12 @@ impl InodeTable {
         let child_path = parent_path.join(name);
         let parent_tree = repo
             .store()
-            .get_tree(parent_path, &parent_tree_id)
+            .get_tree(parent_path.clone(), &parent_tree_id)
             .await
-            .map_err(|_| EIO)?;
+            .map_err(|e| {
+                error!("accessing parent directory {parent_path:?}: {:#}", e);
+                EIO
+            })?;
         let value = parent_tree.value(name).ok_or(ENOENT)?;
         let mut inode = InodeState::new(child_path, value.clone());
         inode.parent = Some(InodeParent {
