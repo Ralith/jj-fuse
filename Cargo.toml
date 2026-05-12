@@ -11,6 +11,7 @@ fractal-fuse = "0.3.1"
 futures-util = { version = "0.3.32", default-features = false, features = ["io"] }
 jj-lib = { git = "https://github.com/Ralith/jj", rev = "ea1eb42db2b42af1f0442c336e53aaba8951338c" }
 libc = "0.2.186"
+pin-project-lite = "0.2.17"
 rustc-hash = "2.1.2"
 slab = "0.4.12"
 tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
