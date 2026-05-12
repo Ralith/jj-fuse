@@ -8,7 +8,8 @@ anyhow = "1.0.102"
 async-trait = "0.1.89"
 clap = { version = "4.6.1", features = ["derive"] }
 fractal-fuse = "0.3.1"
-jj-lib = "0.41.0"
+futures-util = { version = "0.3.32", default-features = false, features = ["io"] }
+jj-lib = { git = "https://github.com/Ralith/jj", rev = "ea1eb42db2b42af1f0442c336e53aaba8951338c" }
 libc = "0.2.186"
 rustc-hash = "2.1.2"
 slab = "0.4.12"

@@ -13,6 +13,7 @@ use fractal_fuse::{
     DirectoryEntry, DirectoryEntryPlus, EIO, EISDIR, ENOENT, ENOTDIR, FileAttr, FileType, FsResult,
     Inode, MountOptions, ReplyAttr, ReplyEntry, ReplyOpen, ReplyStatfs, Request, Timestamp,
 };
+use futures_util::io::AsyncReadExt;
 use jj_lib::backend::{TreeId, TreeValue};
 use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::{ReadonlyRepo, Repo, StoreFactories};
@@ -20,7 +21,6 @@ use jj_lib::repo_path::{RepoPathBuf, RepoPathComponent, RepoPathComponentBuf};
 use jj_lib::settings::UserSettings;
 use rustc_hash::FxHashMap;
 use slab::Slab;
-use tokio::io::AsyncReadExt as _;
 use tracing::trace;
 
 #[derive(Parser)]
@@ -103,7 +103,7 @@ impl fractal_fuse::Filesystem for Fs {
             .await?;
         Ok(ReplyEntry {
             ttl: TTL,
-            attr: self.inodes.stat(inode),
+            attr: self.inodes.stat(&self.repo, inode).await?,
             generation: 0,
         })
     }
@@ -121,7 +121,7 @@ impl fractal_fuse::Filesystem for Fs {
     ) -> FsResult<ReplyAttr> {
         Ok(ReplyAttr {
             ttl: TTL,
-            attr: self.inodes.stat(inode),
+            attr: self.inodes.stat(&self.repo, inode).await?,
         })
     }
 
@@ -267,9 +267,24 @@ impl InodeTable {
         Ok(n)
     }
 
-    fn stat(&self, inode: Inode) -> FileAttr {
-        FileAttr {
+    async fn stat(&self, repo: &ReadonlyRepo, inode: Inode) -> FsResult<FileAttr> {
+        let (path, value) = {
+            let inodes = self.inodes.read().unwrap();
+            let state = inodes.get(inode as usize).unwrap();
+            (state.path.clone(), state.value.clone())
+        };
+        let mut size = 0;
+        if let TreeValue::File { id, .. } = value {
+            let meta = repo
+                .store()
+                .get_file_metadata(&path, &id)
+                .await
+                .map_err(|_| EIO)?;
+            size = meta.size;
+        };
+        Ok(FileAttr {
             ino: inode,
+            size,
             ..value_stat(
                 &self
                     .inodes
@@ -279,7 +294,7 @@ impl InodeTable {
                     .unwrap()
                     .value,
             )
-        }
+        })
     }
 
     async fn readdir<T, F>(
