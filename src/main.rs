@@ -14,7 +14,7 @@ use fractal_fuse::{
     Inode, MountOptions, ReplyAttr, ReplyEntry, ReplyOpen, ReplyStatfs, Request, Timestamp,
 };
 use futures_util::io::AsyncReadExt;
-use jj_lib::backend::{TreeId, TreeValue};
+use jj_lib::backend::{FileId, TreeId, TreeValue};
 use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::{ReadonlyRepo, Repo, StoreFactories};
 use jj_lib::repo_path::{RepoPathBuf, RepoPathComponent, RepoPathComponentBuf};
@@ -235,6 +235,18 @@ impl InodeTable {
         }
     }
 
+    fn get_file_id_path(&self, inode: Inode) -> Option<(FileId, RepoPathBuf)> {
+        let inodes = self.inodes.read().unwrap();
+        let state = inodes.get(inode as usize).unwrap();
+        Some((
+            match &state.value {
+                TreeValue::File { id, .. } => id.clone(),
+                _ => return None,
+            },
+            state.path.clone(),
+        ))
+    }
+
     async fn read(
         &self,
         repo: &ReadonlyRepo,
@@ -242,19 +254,7 @@ impl InodeTable {
         mut offset: u64,
         buf: &mut [u8],
     ) -> FsResult<usize> {
-        let id;
-        let path;
-        {
-            let inodes = self.inodes.read().unwrap();
-            let state = inodes.get(inode as usize).unwrap();
-            id = match &state.value {
-                TreeValue::File { id, .. } => id.clone(),
-                TreeValue::Symlink(_) => todo!(),
-                TreeValue::Tree(_) => return Err(EISDIR),
-                TreeValue::GitSubmodule(_) => return Err(EISDIR),
-            };
-            path = state.path.clone();
-        }
+        let (id, path) = self.get_file_id_path(inode).ok_or(EISDIR)?;
         let mut file = repo.store().read_file(&path, &id).await.map_err(|e| {
             error!("opening {path:?}: {:#}", e);
             EIO
