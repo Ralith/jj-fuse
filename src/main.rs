@@ -667,12 +667,12 @@ fn value_ty(value: &TreeValue) -> FileType {
 
 fn value_stat(value: &TreeValue) -> FileAttr {
     let ty = value_ty(value);
-    let mut mode = 0o444;
+    let mut mode = 0o664;
     mode |= match value {
         TreeValue::File {
             executable: true, ..
         }
-        | TreeValue::Tree(_) => 0o222,
+        | TreeValue::Tree(_) => 0o111,
         _ => 0,
     };
     FileAttr {
