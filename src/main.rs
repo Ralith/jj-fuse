@@ -11,8 +11,9 @@ use anyhow::{Context, anyhow, bail};
 use clap::Parser;
 use fractal_fuse::abi::FUSE_ROOT_ID;
 use fractal_fuse::{
-    DirectoryEntry, DirectoryEntryPlus, EIO, EISDIR, ENOENT, ENOTDIR, FileAttr, FileType, FsResult,
-    Inode, MountOptions, ReplyAttr, ReplyEntry, ReplyOpen, ReplyStatfs, Request, Timestamp,
+    DirectoryEntry, DirectoryEntryPlus, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, FileAttr, FileType,
+    FsResult, Inode, MountOptions, ReplyAttr, ReplyEntry, ReplyOpen, ReplyReadlink, ReplyStatfs,
+    Request, Timestamp,
 };
 use futures_util::AsyncRead;
 use futures_util::io::AsyncReadExt;
@@ -262,6 +263,24 @@ impl fractal_fuse::Filesystem for Fs {
         Ok(data.len())
     }
 
+    async fn readlink(&self, _req: Request, inode: Inode) -> FsResult<ReplyReadlink> {
+        let (path, TreeValue::Symlink(id)) = self.inodes.get_path_value(inode) else {
+            return Err(EINVAL);
+        };
+        let target = self
+            .repo
+            .store()
+            .read_symlink(&path, &id)
+            .await
+            .map_err(|e| {
+                error!("reading symlink {path:?}: {:#}", e);
+                EIO
+            })?;
+        Ok(ReplyReadlink {
+            data: target.into_bytes(),
+        })
+    }
+
     async fn readdir(
         &self,
         _req: Request,
@@ -351,6 +370,12 @@ impl InodeTable {
                 (FUSE_ROOT_ID as usize, root_inode),
             ])),
         }
+    }
+
+    fn get_path_value(&self, inode: Inode) -> (RepoPathBuf, TreeValue) {
+        let inodes = self.inodes.read().unwrap();
+        let state = inodes.get(inode as usize).unwrap();
+        (state.path.clone(), state.value.clone())
     }
 
     fn get_file_id_path(&self, inode: Inode) -> Option<((FileId, bool, CopyId), RepoPathBuf)> {
