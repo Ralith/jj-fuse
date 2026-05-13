@@ -17,7 +17,7 @@ use fractal_fuse::{
 };
 use futures_util::AsyncRead;
 use futures_util::io::AsyncReadExt;
-use jj_lib::backend::{BackendResult, CopyId, FileId, TreeId, TreeValue};
+use jj_lib::backend::{BackendResult, TreeId, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::ref_name::WorkspaceName;
@@ -163,8 +163,17 @@ impl fractal_fuse::Filesystem for Fs {
         _write_flags: u32,
         _flags: u32,
     ) -> FsResult<usize> {
-        let ((id, executable, copy_id), path) =
-            self.inodes.get_file_id_path(inode).ok_or(EISDIR)?;
+        let (
+            path,
+            TreeValue::File {
+                id,
+                executable,
+                copy_id,
+            },
+        ) = self.inodes.get_path_value(inode)
+        else {
+            return Err(EISDIR);
+        };
         let file = self.repo.store().read_file(&path, &id).await.map_err(|e| {
             error!("opening {path:?}: {:#}", e);
             EIO
@@ -378,22 +387,6 @@ impl InodeTable {
         (state.path.clone(), state.value.clone())
     }
 
-    fn get_file_id_path(&self, inode: Inode) -> Option<((FileId, bool, CopyId), RepoPathBuf)> {
-        let inodes = self.inodes.read().unwrap();
-        let state = inodes.get(inode as usize).unwrap();
-        Some((
-            match &state.value {
-                TreeValue::File {
-                    id,
-                    executable,
-                    copy_id,
-                } => (id.clone(), *executable, copy_id.clone()),
-                _ => return None,
-            },
-            state.path.clone(),
-        ))
-    }
-
     async fn read(
         &self,
         repo: &ReadonlyRepo,
@@ -401,7 +394,9 @@ impl InodeTable {
         mut offset: u64,
         buf: &mut [u8],
     ) -> FsResult<usize> {
-        let ((id, _, _), path) = self.get_file_id_path(inode).ok_or(EISDIR)?;
+        let (path, TreeValue::File { id, .. }) = self.get_path_value(inode) else {
+            return Err(EISDIR);
+        };
         let mut file = repo.store().read_file(&path, &id).await.map_err(|e| {
             error!("opening {path:?}: {:#}", e);
             EIO
