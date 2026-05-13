@@ -248,6 +248,16 @@ impl fractal_fuse::Filesystem for Fs {
                 EIO
             })?;
         trace!("updated current commit to {}", commit.id());
+        drop(commit);
+        drop(inodes);
+        tx.repo_mut().rebase_descendants().await.map_err(|e| {
+            error!("rebasing descendants for write to {path:?}: {:#}", e);
+            EIO
+        })?;
+        tx.commit("jj-fuse write").await.map_err(|e| {
+            error!("committing write to {path:?}: {:#}", e);
+            EIO
+        })?;
 
         Ok(data.len())
     }
