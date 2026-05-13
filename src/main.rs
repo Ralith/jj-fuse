@@ -478,10 +478,8 @@ impl InodeTable {
 
     /// Returns `None` if not already resident
     fn get_and_ref(&self, parent: Inode, name: &RepoPathComponent) -> Option<Inode> {
-        let i = *self
-            .inodes
-            .read()
-            .unwrap()
+        let inodes = self.inodes.read().unwrap();
+        let i = *inodes
             .get(parent as usize)?
             .children
             .as_ref()?
@@ -489,6 +487,11 @@ impl InodeTable {
             .read()
             .unwrap()
             .get(name)?;
+        inodes
+            .get(i)
+            .unwrap()
+            .references
+            .fetch_add(1, Ordering::Relaxed);
         Some(i as u64)
     }
 
@@ -516,6 +519,11 @@ impl InodeTable {
                 .as_ref()
                 .and_then(|children| children.nodes.read().unwrap().get(name).copied())
             {
+                inodes
+                    .get(i)
+                    .unwrap()
+                    .references
+                    .fetch_add(1, Ordering::Relaxed);
                 return Ok(i as u64);
             }
 
