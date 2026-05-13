@@ -497,11 +497,14 @@ impl InodeTable {
         let base = offset + entries.len() as u64;
         let limit = size as usize - skip;
         for (i, entry) in iter.skip(skip).take(limit).enumerate() {
-            entries.push(f(
-                entry.value(),
-                entry.name().to_fs_name().unwrap(),
-                i as u64 + base + 1,
-            ));
+            let name = match entry.name().to_fs_name() {
+                Ok(name) => name,
+                Err(e) => {
+                    error!("hiding unrepresentable name {:?}: {:#}", entry.name(), e);
+                    continue;
+                }
+            };
+            entries.push(f(entry.value(), name, i as u64 + base + 1));
         }
         Ok(entries)
     }
