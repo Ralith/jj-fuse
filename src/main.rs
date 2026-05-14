@@ -60,9 +60,7 @@ fn run() -> anyhow::Result<()> {
 }
 
 struct Fs {
-    commit: Mutex<Commit>,
-    repo: Arc<ReadonlyRepo>,
-    inodes: InodeTable,
+    shared: Arc<Shared>,
 }
 
 impl Fs {
@@ -90,26 +88,33 @@ impl Fs {
             bail!("conflicted trees are not implemented");
         };
         Ok(Self {
-            commit: Mutex::new(commit),
-            repo,
-            inodes: InodeTable::new(tree_id),
+            shared: Arc::new(Shared {
+                commit: Mutex::new(commit),
+                repo,
+                inodes: InodeTable::new(tree_id),
+            }),
         })
     }
 
     async fn write_commit(&self) -> anyhow::Result<()> {
         // Construct a tree with a recent state for every open inode
-        let TreeValue::Tree(id) = self.inodes.flatten_value(&self.repo, FUSE_ROOT_ID).await? else {
+        let TreeValue::Tree(id) = self
+            .shared
+            .inodes
+            .flatten_value(&self.shared.repo, FUSE_ROOT_ID)
+            .await?
+        else {
             // Root inode is always a tree
             unreachable!()
         };
 
         // Rewrite the commit with that tree
-        let mut commit = self.commit.lock().unwrap();
-        let mut tx = self.repo.start_transaction();
+        let mut commit = self.shared.commit.lock().unwrap();
+        let mut tx = self.shared.repo.start_transaction();
         *commit = tx
             .repo_mut()
             .rewrite_commit(&*commit)
-            .set_tree(MergedTree::resolved(self.repo.store().clone(), id))
+            .set_tree(MergedTree::resolved(self.shared.repo.store().clone(), id))
             .write()
             .await?;
         trace!("updated current commit to {}", commit.id());
@@ -134,18 +139,19 @@ impl fractal_fuse::Filesystem for Fs {
             return Err(ENOENT);
         };
         let inode = self
+            .shared
             .inodes
-            .get_or_insert_and_ref(&self.repo, parent, name)
+            .get_or_insert_and_ref(&self.shared.repo, parent, name)
             .await?;
         Ok(ReplyEntry {
             ttl: TTL,
-            attr: self.inodes.stat(&self.repo, inode).await?,
+            attr: self.shared.inodes.stat(&self.shared.repo, inode).await?,
             generation: 0,
         })
     }
 
     fn forget(&self, _: Request, inode: Inode, nlookup: u64) {
-        self.inodes.forget(inode, nlookup);
+        self.shared.inodes.forget(inode, nlookup);
     }
 
     async fn getattr(
@@ -157,7 +163,7 @@ impl fractal_fuse::Filesystem for Fs {
     ) -> FsResult<ReplyAttr> {
         Ok(ReplyAttr {
             ttl: TTL,
-            attr: self.inodes.stat(&self.repo, inode).await?,
+            attr: self.shared.inodes.stat(&self.shared.repo, inode).await?,
         })
     }
 
@@ -177,7 +183,10 @@ impl fractal_fuse::Filesystem for Fs {
         offset: u64,
         buf: &mut [u8],
     ) -> FsResult<usize> {
-        self.inodes.read(&self.repo, inode, offset, buf).await
+        self.shared
+            .inodes
+            .read(&self.shared.repo, inode, offset, buf)
+            .await
     }
 
     async fn write(
@@ -190,7 +199,7 @@ impl fractal_fuse::Filesystem for Fs {
         _write_flags: u32,
         _flags: u32,
     ) -> FsResult<usize> {
-        let inodes = self.inodes.inodes.read().unwrap();
+        let inodes = self.shared.inodes.inodes.read().unwrap();
         let state = inodes.get(inode as usize).unwrap();
         let value = &mut state.mutable_state.write().unwrap().value;
         let TreeValue::File {
@@ -204,6 +213,7 @@ impl fractal_fuse::Filesystem for Fs {
         let executable = *executable;
         let copy_id = copy_id.clone();
         let file = self
+            .shared
             .repo
             .store()
             .read_file(&state.path, id)
@@ -215,6 +225,7 @@ impl fractal_fuse::Filesystem for Fs {
         trace!("opened old file {id}");
         // Create a new file with the specified data overwritten
         let updated_file = self
+            .shared
             .repo
             .store()
             .write_file(
@@ -241,10 +252,11 @@ impl fractal_fuse::Filesystem for Fs {
     }
 
     async fn readlink(&self, _req: Request, inode: Inode) -> FsResult<ReplyReadlink> {
-        let (path, TreeValue::Symlink(id)) = self.inodes.get_path_value(inode) else {
+        let (path, TreeValue::Symlink(id)) = self.shared.inodes.get_path_value(inode) else {
             return Err(EINVAL);
         };
         let target = self
+            .shared
             .repo
             .store()
             .read_symlink(&path, &id)
@@ -266,15 +278,20 @@ impl fractal_fuse::Filesystem for Fs {
         offset: u64,
         size: u32,
     ) -> FsResult<Vec<DirectoryEntry>> {
-        self.inodes
-            .readdir(&self.repo, inode, offset, size, |value, name, offset| {
-                DirectoryEntry {
+        self.shared
+            .inodes
+            .readdir(
+                &self.shared.repo,
+                inode,
+                offset,
+                size,
+                |value, name, offset| DirectoryEntry {
                     ino: 0,
                     offset,
                     kind: value_ty(value),
                     name: name.as_bytes().to_vec(),
-                }
-            })
+                },
+            )
             .await
     }
 
@@ -286,9 +303,14 @@ impl fractal_fuse::Filesystem for Fs {
         offset: u64,
         size: u32,
     ) -> FsResult<Vec<DirectoryEntryPlus>> {
-        self.inodes
-            .readdir(&self.repo, inode, offset, size, |value, name, offset| {
-                DirectoryEntryPlus {
+        self.shared
+            .inodes
+            .readdir(
+                &self.shared.repo,
+                inode,
+                offset,
+                size,
+                |value, name, offset| DirectoryEntryPlus {
                     ino: 0,
                     offset,
                     kind: value_ty(value),
@@ -296,8 +318,8 @@ impl fractal_fuse::Filesystem for Fs {
                     entry_ttl: TTL,
                     attr: value_stat(value),
                     generation: 0,
-                }
-            })
+                },
+            )
             .await
     }
 
@@ -325,6 +347,12 @@ impl fractal_fuse::Filesystem for Fs {
     async fn access(&self, _req: Request, _inode: u64, _mask: u32) -> FsResult<()> {
         Ok(())
     }
+}
+
+struct Shared {
+    commit: Mutex<Commit>,
+    repo: Arc<ReadonlyRepo>,
+    inodes: InodeTable,
 }
 
 struct InodeTable {
