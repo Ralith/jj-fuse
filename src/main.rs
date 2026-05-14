@@ -17,14 +17,12 @@ use fractal_fuse::{
 };
 use futures_util::AsyncRead;
 use futures_util::io::AsyncReadExt;
-use jj_lib::backend::{BackendResult, TreeId, TreeValue};
+use jj_lib::backend::{TreeId, TreeValue};
 use jj_lib::commit::Commit;
-use jj_lib::merged_tree::MergedTree;
 use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::{ReadonlyRepo, Repo, StoreFactories};
-use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponent, RepoPathComponentBuf};
+use jj_lib::repo_path::{RepoPathBuf, RepoPathComponent, RepoPathComponentBuf};
 use jj_lib::settings::UserSettings;
-use jj_lib::tree::Tree;
 use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use slab::Slab;
@@ -163,28 +161,35 @@ impl fractal_fuse::Filesystem for Fs {
         _write_flags: u32,
         _flags: u32,
     ) -> FsResult<usize> {
-        let (
-            path,
-            TreeValue::File {
-                id,
-                executable,
-                copy_id,
-            },
-        ) = self.inodes.get_path_value(inode)
+        let inodes = self.inodes.inodes.read().unwrap();
+        let state = inodes.get(inode as usize).unwrap();
+        let mut value = state.value.write().unwrap();
+        let TreeValue::File {
+            id,
+            executable,
+            copy_id,
+        } = &*value
         else {
             return Err(EISDIR);
         };
-        let file = self.repo.store().read_file(&path, &id).await.map_err(|e| {
-            error!("opening {path:?}: {:#}", e);
-            EIO
-        })?;
+        let executable = *executable;
+        let copy_id = copy_id.clone();
+        let file = self
+            .repo
+            .store()
+            .read_file(&state.path, id)
+            .await
+            .map_err(|e| {
+                error!("opening {:?}: {:#}", state.path, e);
+                EIO
+            })?;
         trace!("opened old file {id}");
         // Create a new file with the specified data overwritten
         let updated_file = self
             .repo
             .store()
             .write_file(
-                &path,
+                &state.path,
                 &mut Overwrite {
                     inner: file,
                     offset,
@@ -193,81 +198,15 @@ impl fractal_fuse::Filesystem for Fs {
             )
             .await
             .map_err(|e| {
-                error!("writing {path:?}: {:#}", e);
+                error!("writing {:?}: {:#}", state.path, e);
                 EIO
             })?;
         trace!("created edited file {updated_file}");
-
-        let TreeValue::Tree(root_id) = self
-            .inodes
-            .inodes
-            .read()
-            .unwrap()
-            .get(FUSE_ROOT_ID as usize)
-            .unwrap()
-            .value
-            .clone()
-        else {
-            unreachable!()
+        *value = TreeValue::File {
+            id: updated_file,
+            executable,
+            copy_id,
         };
-        let old_tree = self
-            .repo
-            .store()
-            .get_tree(RepoPathBuf::root(), &root_id)
-            .await
-            .map_err(|e| {
-                error!("fetching tree: {:#}", e);
-                EIO
-            })?;
-
-        // TODO: Concurrent writes
-        let mut inodes = self.inodes.inodes.write().unwrap();
-        let new_tree = tree_insert(
-            &mut *inodes,
-            FUSE_ROOT_ID as usize,
-            &old_tree,
-            RepoPath::root(),
-            &path,
-            TreeValue::File {
-                id: updated_file,
-                executable,
-                copy_id,
-            },
-        )
-        .await
-        .map_err(|e| {
-            error!("building tree: {:#}", e);
-            EIO
-        })?;
-        trace!("created edited tree {}", new_tree.id());
-
-        // TODO: Concurrent writes
-        let mut commit = self.commit.lock().unwrap();
-        let mut tx = self.repo.start_transaction();
-        *commit = tx
-            .repo_mut()
-            .rewrite_commit(&*commit)
-            .set_tree(MergedTree::resolved(
-                self.repo.store().clone(),
-                new_tree.id().clone(),
-            ))
-            .write()
-            .await
-            .map_err(|e| {
-                error!("committing write to {path:?}: {:#}", e);
-                EIO
-            })?;
-        trace!("updated current commit to {}", commit.id());
-        drop(commit);
-        drop(inodes);
-        tx.repo_mut().rebase_descendants().await.map_err(|e| {
-            error!("rebasing descendants for write to {path:?}: {:#}", e);
-            EIO
-        })?;
-        tx.commit("jj-fuse write").await.map_err(|e| {
-            error!("committing write to {path:?}: {:#}", e);
-            EIO
-        })?;
 
         Ok(data.len())
     }
@@ -384,7 +323,7 @@ impl InodeTable {
     fn get_path_value(&self, inode: Inode) -> (RepoPathBuf, TreeValue) {
         let inodes = self.inodes.read().unwrap();
         let state = inodes.get(inode as usize).unwrap();
-        (state.path.clone(), state.value.clone())
+        (state.path.clone(), state.value.read().unwrap().clone())
     }
 
     async fn read(
@@ -418,13 +357,9 @@ impl InodeTable {
     }
 
     async fn stat(&self, repo: &ReadonlyRepo, inode: Inode) -> FsResult<FileAttr> {
-        let (path, value) = {
-            let inodes = self.inodes.read().unwrap();
-            let state = inodes.get(inode as usize).unwrap();
-            (state.path.clone(), state.value.clone())
-        };
+        let (path, value) = self.get_path_value(inode);
         let mut size = 0;
-        if let TreeValue::File { id, .. } = value {
+        if let TreeValue::File { id, .. } = &value {
             let meta = repo
                 .store()
                 .get_file_metadata(&path, &id)
@@ -438,15 +373,7 @@ impl InodeTable {
         Ok(FileAttr {
             ino: inode,
             size,
-            ..value_stat(
-                &self
-                    .inodes
-                    .read()
-                    .unwrap()
-                    .get(inode as usize)
-                    .unwrap()
-                    .value,
-            )
+            ..value_stat(&value)
         })
     }
 
@@ -467,18 +394,23 @@ impl InodeTable {
         {
             let inodes = self.inodes.read().unwrap();
             let state = inodes.get(inode as usize).unwrap();
-            let TreeValue::Tree(id) = &state.value else {
+            let value = state.value.read().unwrap().clone();
+            let TreeValue::Tree(id) = &value else {
                 return Err(ENOTDIR);
             };
             dir_path = state.path.clone();
             tree_id = id.clone();
             if offset < 1 {
-                entries.push(f(&state.value, ".", 1));
+                entries.push(f(&value, ".", 1));
             }
             if offset < 2
                 && let Some(p) = &state.parent
             {
-                entries.push(f(&inodes.get(p.parent).unwrap().value, "..", 2));
+                entries.push(f(
+                    &inodes.get(p.parent).unwrap().value.read().unwrap(),
+                    "..",
+                    2,
+                ));
             }
         }
         let tree = repo
@@ -540,42 +472,33 @@ impl InodeTable {
             return Ok(i);
         }
 
-        let parent_tree_id;
-        let parent_path;
-        {
-            let mut inodes = self.inodes.write().unwrap();
-            // Guard against races
-            if let Some(i) = inodes
-                .get(parent_ino as usize)
+        let mut inodes = self.inodes.write().unwrap();
+        let Some(children) = &inodes.get(parent_ino as usize).unwrap().children else {
+            return Err(ENOTDIR);
+        };
+        // Guard against races with another identical call to this method
+        if let Some(i) = children.nodes.read().unwrap().get(name).copied() {
+            inodes
+                .get(i)
                 .unwrap()
-                .children
-                .as_ref()
-                .and_then(|children| children.nodes.read().unwrap().get(name).copied())
-            {
-                inodes
-                    .get(i)
-                    .unwrap()
-                    .references
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(i as u64);
-            }
-
-            // Create a child inode
-            let parent = inodes.get_mut(parent_ino as usize).unwrap();
-            let TreeValue::Tree(id) = &parent.value else {
-                return Err(ENOTDIR);
-            };
-            parent_tree_id = id.clone();
-            parent_path = parent.path.clone();
+                .references
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(i as u64);
         }
 
-        let child_path = parent_path.join(name);
+        // Create a child inode
+        let parent = inodes.get(parent_ino as usize).unwrap();
+        let TreeValue::Tree(parent_tree_id) = parent.value.read().unwrap().clone() else {
+            unreachable!()
+        };
+
+        let child_path = parent.path.join(name);
         let parent_tree = repo
             .store()
-            .get_tree(parent_path.clone(), &parent_tree_id)
+            .get_tree(parent.path.clone(), &parent_tree_id)
             .await
             .map_err(|e| {
-                error!("accessing parent directory {parent_path:?}: {:#}", e);
+                error!("accessing parent directory {:?}: {:#}", parent.path, e);
                 EIO
             })?;
         let value = parent_tree.value(name).ok_or(ENOENT)?;
@@ -587,7 +510,6 @@ impl InodeTable {
         if let TreeValue::Tree(_) = value {
             inode.children = Some(InodeChildren::new());
         }
-        let mut inodes = self.inodes.write().unwrap();
         let n = inodes.insert(inode);
         trace!("{:?} is inode {}", inodes.get(n).unwrap().path, n);
         inodes
@@ -640,7 +562,8 @@ impl InodeTable {
 
 struct InodeState {
     path: RepoPathBuf,
-    value: TreeValue,
+    /// May diverge from what's recorded in the parent until flushed
+    value: RwLock<TreeValue>,
     references: AtomicU64,
     parent: Option<InodeParent>,
     /// Populated iff value is Tree
@@ -651,7 +574,7 @@ impl InodeState {
     fn new(path: RepoPathBuf, value: TreeValue) -> Self {
         Self {
             path,
-            value,
+            value: RwLock::new(value),
             references: AtomicU64::new(1),
             parent: None,
             children: None,
@@ -747,73 +670,6 @@ impl<T: AsyncRead> AsyncRead for Overwrite<'_, T> {
         *this.data = remaining;
         Poll::Ready(Ok(overflow))
     }
-}
-
-async fn tree_insert(
-    inodes: &mut Slab<InodeState>,
-    parent_inode: usize,
-    old: &Tree,
-    path_so_far: &RepoPath,
-    path_remaining: &RepoPath,
-    value: TreeValue,
-) -> BackendResult<Tree> {
-    let mut iter = path_remaining.components();
-    let first = iter.next().unwrap();
-    let rest = iter.as_path();
-    let old_entries = old.data().entries();
-    let mut new_entries = Vec::new();
-    for entry in old_entries {
-        if entry.name() != first {
-            // Untouched entry
-            new_entries.push((entry.name().to_owned(), entry.value().clone()));
-            continue;
-        }
-        let inode = *inodes
-            .get(parent_inode)
-            .unwrap()
-            .children
-            .as_ref()
-            .unwrap()
-            .nodes
-            .read()
-            .unwrap()
-            .get(entry.name())
-            .unwrap();
-        if rest.as_internal_file_string().is_empty() {
-            // Replaced entry
-            new_entries.push((entry.name().to_owned(), value.clone()));
-            trace!("updating {path_so_far:?}/{first:?} to {:?}", value);
-            inodes.get_mut(inode).unwrap().value = value.clone();
-            continue;
-        }
-        // Tree containing edited replaced at some depth
-        let TreeValue::Tree(subtree) = entry.value() else {
-            unreachable!();
-        };
-        let old_subtree = old
-            .store()
-            .get_tree(path_so_far.to_owned(), &subtree)
-            .await?;
-        let absolute_path = path_so_far.join(entry.name());
-        let new_subtree = Box::pin(tree_insert(
-            inodes,
-            inode,
-            &old_subtree,
-            &absolute_path,
-            rest,
-            value.clone(),
-        ))
-        .await?;
-        new_entries.push((
-            entry.name().to_owned(),
-            TreeValue::Tree(new_subtree.id().clone()),
-        ));
-    }
-    let new_tree = jj_lib::backend::Tree::from_sorted_entries(new_entries);
-    let new_tree = old.store().write_tree(path_so_far, new_tree).await?;
-    trace!("updating tree at {path_so_far:?} to {}", new_tree.id());
-    inodes.get_mut(parent_inode).unwrap().value = TreeValue::Tree(new_tree.id().clone());
-    Ok(new_tree)
 }
 
 const TTL: Duration = Duration::from_secs(60);
