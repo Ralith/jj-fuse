@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::task::{Poll, ready};
 use std::time::Duration;
 use std::{path::PathBuf, process::ExitCode};
@@ -89,8 +89,7 @@ impl Fs {
         };
         Ok(Self {
             shared: Arc::new(Shared {
-                commit: Mutex::new(commit),
-                repo,
+                repo_state: RwLock::new(RepoState { repo, commit }),
                 inodes: InodeTable::new(tree_id),
             }),
         })
@@ -101,7 +100,7 @@ impl Fs {
         let TreeValue::Tree(id) = self
             .shared
             .inodes
-            .flatten_value(&self.shared.repo, FUSE_ROOT_ID)
+            .flatten_value(&self.shared.repo(), FUSE_ROOT_ID)
             .await?
         else {
             // Root inode is always a tree
@@ -109,17 +108,25 @@ impl Fs {
         };
 
         // Rewrite the commit with that tree
-        let mut commit = self.shared.commit.lock().unwrap();
-        let mut tx = self.shared.repo.start_transaction();
-        *commit = tx
+        let mut state = self.shared.repo_state.write().unwrap();
+        let mut tx = state.repo.start_transaction();
+        let new_commit = tx
             .repo_mut()
-            .rewrite_commit(&*commit)
-            .set_tree(MergedTree::resolved(self.shared.repo.store().clone(), id))
+            .rewrite_commit(&state.commit)
+            .set_tree(MergedTree::resolved(state.repo.store().clone(), id))
             .write()
-            .await?;
-        trace!("updated current commit to {}", commit.id());
-        tx.repo_mut().rebase_descendants().await?;
-        tx.commit("jj-fuse flush").await?;
+            .await
+            .context("rewriting commit")?;
+        state.commit = new_commit;
+        trace!("updated current commit to {}", state.commit.id());
+        tx.repo_mut()
+            .rebase_descendants()
+            .await
+            .context("rebasing descendants")?;
+        state.repo = tx
+            .commit("jj-fuse flush")
+            .await
+            .context("committing transaction")?;
         Ok(())
     }
 }
@@ -138,14 +145,15 @@ impl fractal_fuse::Filesystem for Fs {
         let Ok(name) = RepoPathComponent::new(name) else {
             return Err(ENOENT);
         };
+        let repo = self.shared.repo();
         let inode = self
             .shared
             .inodes
-            .get_or_insert_and_ref(&self.shared.repo, parent, name)
+            .get_or_insert_and_ref(&repo, parent, name)
             .await?;
         Ok(ReplyEntry {
             ttl: TTL,
-            attr: self.shared.inodes.stat(&self.shared.repo, inode).await?,
+            attr: self.shared.inodes.stat(&repo, inode).await?,
             generation: 0,
         })
     }
@@ -163,7 +171,7 @@ impl fractal_fuse::Filesystem for Fs {
     ) -> FsResult<ReplyAttr> {
         Ok(ReplyAttr {
             ttl: TTL,
-            attr: self.shared.inodes.stat(&self.shared.repo, inode).await?,
+            attr: self.shared.inodes.stat(&self.shared.repo(), inode).await?,
         })
     }
 
@@ -185,7 +193,7 @@ impl fractal_fuse::Filesystem for Fs {
     ) -> FsResult<usize> {
         self.shared
             .inodes
-            .read(&self.shared.repo, inode, offset, buf)
+            .read(&self.shared.repo(), inode, offset, buf)
             .await
     }
 
@@ -214,7 +222,7 @@ impl fractal_fuse::Filesystem for Fs {
         let copy_id = copy_id.clone();
         let file = self
             .shared
-            .repo
+            .repo()
             .store()
             .read_file(&state.path, id)
             .await
@@ -226,7 +234,7 @@ impl fractal_fuse::Filesystem for Fs {
         // Create a new file with the specified data overwritten
         let updated_file = self
             .shared
-            .repo
+            .repo()
             .store()
             .write_file(
                 &state.path,
@@ -257,7 +265,7 @@ impl fractal_fuse::Filesystem for Fs {
         };
         let target = self
             .shared
-            .repo
+            .repo()
             .store()
             .read_symlink(&path, &id)
             .await
@@ -281,7 +289,7 @@ impl fractal_fuse::Filesystem for Fs {
         self.shared
             .inodes
             .readdir(
-                &self.shared.repo,
+                &self.shared.repo(),
                 inode,
                 offset,
                 size,
@@ -306,7 +314,7 @@ impl fractal_fuse::Filesystem for Fs {
         self.shared
             .inodes
             .readdir(
-                &self.shared.repo,
+                &self.shared.repo(),
                 inode,
                 offset,
                 size,
@@ -350,9 +358,20 @@ impl fractal_fuse::Filesystem for Fs {
 }
 
 struct Shared {
-    commit: Mutex<Commit>,
-    repo: Arc<ReadonlyRepo>,
+    repo_state: RwLock<RepoState>,
     inodes: InodeTable,
+}
+
+impl Shared {
+    fn repo(&self) -> Arc<ReadonlyRepo> {
+        self.repo_state.read().unwrap().repo.clone()
+    }
+}
+
+/// Identifies the committed state a VFS view is based on
+struct RepoState {
+    repo: Arc<ReadonlyRepo>,
+    commit: Commit,
 }
 
 struct InodeTable {
