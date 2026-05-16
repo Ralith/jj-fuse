@@ -52,10 +52,13 @@ fn run() -> anyhow::Result<()> {
     let fs = rt
         .block_on(Fs::new(&args.repository))
         .context("opening repository")?;
+    let shared = fs.shared.clone();
     trace!("mounting");
     fractal_fuse::Session::new(args.mountpoint, MountOptions::new().fs_name("jj"))?
         .queue_depth(128)
         .run(fs)?;
+    rt.block_on(shared.write_commit())
+        .context("committing final state")?;
     Ok(())
 }
 
@@ -94,46 +97,11 @@ impl Fs {
             }),
         })
     }
-
-    async fn write_commit(&self) -> anyhow::Result<()> {
-        // Construct a tree with a recent state for every open inode
-        let TreeValue::Tree(id) = self
-            .shared
-            .inodes
-            .flatten_value(&self.shared.repo(), FUSE_ROOT_ID)
-            .await?
-        else {
-            // Root inode is always a tree
-            unreachable!()
-        };
-
-        // Rewrite the commit with that tree
-        let mut state = self.shared.repo_state.write().unwrap();
-        let mut tx = state.repo.start_transaction();
-        let new_commit = tx
-            .repo_mut()
-            .rewrite_commit(&state.commit)
-            .set_tree(MergedTree::resolved(state.repo.store().clone(), id))
-            .write()
-            .await
-            .context("rewriting commit")?;
-        state.commit = new_commit;
-        trace!("updated current commit to {}", state.commit.id());
-        tx.repo_mut()
-            .rebase_descendants()
-            .await
-            .context("rebasing descendants")?;
-        state.repo = tx
-            .commit("jj-fuse flush")
-            .await
-            .context("committing transaction")?;
-        Ok(())
-    }
 }
 
 impl fractal_fuse::Filesystem for Fs {
     async fn destroy(&self) {
-        if let Err(e) = self.write_commit().await {
+        if let Err(e) = self.shared.write_commit().await {
             error!("failed to flush on exit: {:#}", e);
         }
     }
@@ -193,7 +161,7 @@ impl fractal_fuse::Filesystem for Fs {
         _flush: bool,
         _flock_release: bool,
     ) -> FsResult<()> {
-        if let Err(e) = self.write_commit().await {
+        if let Err(e) = self.shared.write_commit().await {
             error!("writing commit on close: {:#}", e);
         }
         Ok(())
@@ -425,6 +393,40 @@ struct Shared {
 impl Shared {
     fn repo(&self) -> Arc<ReadonlyRepo> {
         self.repo_state.read().unwrap().repo.clone()
+    }
+
+    async fn write_commit(&self) -> anyhow::Result<()> {
+        // Construct a tree with a recent state for every open inode
+        let TreeValue::Tree(id) = self
+            .inodes
+            .flatten_value(&self.repo_state.read().unwrap().repo, FUSE_ROOT_ID)
+            .await?
+        else {
+            // Root inode is always a tree
+            unreachable!()
+        };
+
+        // Rewrite the commit with that tree
+        let mut state = self.repo_state.write().unwrap();
+        let mut tx = state.repo.start_transaction();
+        let new_commit = tx
+            .repo_mut()
+            .rewrite_commit(&state.commit)
+            .set_tree(MergedTree::resolved(state.repo.store().clone(), id))
+            .write()
+            .await
+            .context("rewriting commit")?;
+        state.commit = new_commit;
+        trace!("updated current commit to {}", state.commit.id());
+        tx.repo_mut()
+            .rebase_descendants()
+            .await
+            .context("rebasing descendants")?;
+        state.repo = tx
+            .commit("jj-fuse flush")
+            .await
+            .context("committing transaction")?;
+        Ok(())
     }
 }
 
