@@ -53,9 +53,9 @@ fn run() -> anyhow::Result<()> {
         .block_on(Fs::new(&args.repository))
         .context("opening repository")?;
     trace!("mounting");
-    fractal_fuse::Session::new(MountOptions::new().fs_name("jj"))
+    fractal_fuse::Session::new(args.mountpoint, MountOptions::new().fs_name("jj"))?
         .queue_depth(128)
-        .run(fs, &args.mountpoint)?;
+        .run(fs)?;
     Ok(())
 }
 

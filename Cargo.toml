@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 clap = { version = "4.6.1", features = ["derive"] }
-fractal-fuse = "0.3.1"
+fractal-fuse = { git = "https://github.com/fractalbits-labs/fractalbits.git", rev = "798a95c577f7abd03147cad97d5a70932c07a5be" }
 futures-util = { version = "0.3.32", default-features = false, features = ["io"] }
 jj-lib = { git = "https://github.com/Ralith/jj", rev = "ea1eb42db2b42af1f0442c336e53aaba8951338c" }
 libc = "0.2.186"
