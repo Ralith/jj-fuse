@@ -183,6 +183,22 @@ impl fractal_fuse::Filesystem for Fs {
         })
     }
 
+    async fn release(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+        _flock_release: bool,
+    ) -> FsResult<()> {
+        if let Err(e) = self.write_commit().await {
+            error!("writing commit on close: {:#}", e);
+        }
+        Ok(())
+    }
+
     async fn read(
         &self,
         _req: Request,
