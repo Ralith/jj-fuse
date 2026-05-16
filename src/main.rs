@@ -425,17 +425,10 @@ impl Shared {
     }
 
     async fn write_commit(&self) -> anyhow::Result<()> {
-        // Construct a tree with a recent state for every open inode
-        let TreeValue::Tree(id) = self
-            .inodes
-            .flatten_value(&self.repo_state.read().await.repo, FUSE_ROOT_ID)
-            .await?
-        else {
-            // Root inode is always a tree
+        let TreeValue::Tree(id) = self.inodes.get(FUSE_ROOT_ID).await else {
             unreachable!()
         };
-
-        // Rewrite the commit with that tree
+        // Rewrite the commit with the current tree
         let mut state = self.repo_state.write().await;
         let mut tx = state.repo.start_transaction();
         let new_commit = tx
@@ -482,6 +475,19 @@ impl InodeTable {
                 (FUSE_ROOT_ID as usize, root_inode),
             ])),
         }
+    }
+
+    async fn get(&self, inode: Inode) -> TreeValue {
+        self.inodes
+            .read()
+            .await
+            .get(inode as usize)
+            .unwrap()
+            .mutable_state
+            .read()
+            .await
+            .value
+            .clone()
     }
 
     async fn get_path(&self, inode: Inode) -> RepoPathBuf {
@@ -743,49 +749,6 @@ impl InodeTable {
                 .unwrap();
             debug_assert_eq!(parent_child, i);
         }
-    }
-
-    /// Obtain a `TreeValue` that independently represents a recent state of `inode`
-    async fn flatten_value(&self, repo: &ReadonlyRepo, inode: Inode) -> BackendResult<TreeValue> {
-        let (path, base, current_children) = {
-            let inodes = self.inodes.read().await;
-            let state = inodes.get(inode as usize).unwrap();
-            let mutable = state.mutable_state.read().await;
-            (
-                state.path.clone(),
-                mutable.value.clone(),
-                mutable.children.clone(),
-            )
-        };
-        // Non-tree inodes are self-contained (for now)
-        let tree_id = match base {
-            TreeValue::Tree(tree_id) => tree_id,
-            _ => return Ok(base),
-        };
-        let tree = repo.store().get_tree(path.clone(), &tree_id).await?;
-        let mut fresh_children = Vec::new();
-        let mut current_children = current_children.unwrap();
-        for entry in tree.entries_non_recursive() {
-            if let Some((name, inode)) = current_children.remove_entry(entry.name()) {
-                // Potentially edited child
-                let flattened = Box::pin(self.flatten_value(repo, inode as Inode)).await?;
-                fresh_children.push((name, flattened));
-            } else {
-                // Untouched child
-                fresh_children.push((entry.name().to_owned(), entry.value().clone()));
-            }
-        }
-        // New children
-        for (name, inode) in current_children {
-            let flattened = Box::pin(self.flatten_value(repo, inode as Inode)).await?;
-            fresh_children.push((name, flattened));
-        }
-        fresh_children.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let fresh_tree = repo
-            .store()
-            .write_tree(&path, Tree::from_sorted_entries(fresh_children))
-            .await?;
-        Ok(TreeValue::Tree(fresh_tree.id().clone()))
     }
 
     async fn insert(
