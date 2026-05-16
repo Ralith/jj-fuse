@@ -1,8 +1,8 @@
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::task::{Poll, ready};
 use std::time::Duration;
 use std::{path::PathBuf, process::ExitCode};
@@ -27,6 +27,7 @@ use jj_lib::settings::UserSettings;
 use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use slab::Slab;
+use tokio::sync::RwLock;
 use tracing::{error, trace};
 
 #[derive(Parser)]
@@ -113,7 +114,7 @@ impl fractal_fuse::Filesystem for Fs {
         let Ok(name) = RepoPathComponent::new(name) else {
             return Err(ENOENT);
         };
-        let repo = self.shared.repo();
+        let repo = self.shared.repo().await;
         let inode = self
             .shared
             .inodes
@@ -127,7 +128,11 @@ impl fractal_fuse::Filesystem for Fs {
     }
 
     fn forget(&self, _: Request, inode: Inode, nlookup: u64) {
-        self.shared.inodes.forget(inode, nlookup);
+        let shared = self.shared.clone();
+        compio_runtime::spawn(async move {
+            shared.inodes.forget(inode, nlookup).await;
+        })
+        .detach();
     }
 
     async fn getattr(
@@ -139,7 +144,11 @@ impl fractal_fuse::Filesystem for Fs {
     ) -> FsResult<ReplyAttr> {
         Ok(ReplyAttr {
             ttl: TTL,
-            attr: self.shared.inodes.stat(&self.shared.repo(), inode).await?,
+            attr: self
+                .shared
+                .inodes
+                .stat(&*self.shared.repo().await, inode)
+                .await?,
         })
     }
 
@@ -177,7 +186,7 @@ impl fractal_fuse::Filesystem for Fs {
     ) -> FsResult<usize> {
         self.shared
             .inodes
-            .read(&self.shared.repo(), inode, offset, buf)
+            .read(&*self.shared.repo().await, inode, offset, buf)
             .await
     }
 
@@ -191,9 +200,9 @@ impl fractal_fuse::Filesystem for Fs {
         _write_flags: u32,
         _flags: u32,
     ) -> FsResult<usize> {
-        let inodes = self.shared.inodes.inodes.read().unwrap();
+        let inodes = self.shared.inodes.inodes.read().await;
         let state = inodes.get(inode as usize).unwrap();
-        let value = &mut state.mutable_state.write().unwrap().value;
+        let value = &mut state.mutable_state.write().await.value;
         let TreeValue::File {
             id,
             executable,
@@ -207,6 +216,7 @@ impl fractal_fuse::Filesystem for Fs {
         let file = self
             .shared
             .repo()
+            .await
             .store()
             .read_file(&state.path, id)
             .await
@@ -219,6 +229,7 @@ impl fractal_fuse::Filesystem for Fs {
         let updated_file = self
             .shared
             .repo()
+            .await
             .store()
             .write_file(
                 &state.path,
@@ -250,7 +261,7 @@ impl fractal_fuse::Filesystem for Fs {
         name: &OsStr,
         link: &OsStr,
     ) -> FsResult<ReplyEntry> {
-        let parent_path = self.shared.inodes.get_path(parent);
+        let parent_path = self.shared.inodes.get_path(parent).await;
         let name = RepoPathComponent::new(name.to_str().ok_or_else(|| {
             error!("non-Unicode symlink name: {name:?}");
             EINVAL
@@ -263,6 +274,7 @@ impl fractal_fuse::Filesystem for Fs {
         let id = self
             .shared
             .repo()
+            .await
             .store()
             .write_symlink(
                 &path,
@@ -278,7 +290,7 @@ impl fractal_fuse::Filesystem for Fs {
             })?;
         let value = TreeValue::Symlink(id);
         let attr = value_stat(&value);
-        let ino = self.shared.inodes.insert(parent, name, value);
+        let ino = self.shared.inodes.insert(parent, name, value).await;
 
         Ok(ReplyEntry {
             ttl: TTL,
@@ -288,12 +300,13 @@ impl fractal_fuse::Filesystem for Fs {
     }
 
     async fn readlink(&self, _req: Request, inode: Inode) -> FsResult<ReplyReadlink> {
-        let (path, TreeValue::Symlink(id)) = self.shared.inodes.get_path_value(inode) else {
+        let (path, TreeValue::Symlink(id)) = self.shared.inodes.get_path_value(inode).await else {
             return Err(EINVAL);
         };
         let target = self
             .shared
             .repo()
+            .await
             .store()
             .read_symlink(&path, &id)
             .await
@@ -317,7 +330,7 @@ impl fractal_fuse::Filesystem for Fs {
         self.shared
             .inodes
             .readdir(
-                &self.shared.repo(),
+                &*self.shared.repo().await,
                 inode,
                 offset,
                 size,
@@ -342,7 +355,7 @@ impl fractal_fuse::Filesystem for Fs {
         self.shared
             .inodes
             .readdir(
-                &self.shared.repo(),
+                &*self.shared.repo().await,
                 inode,
                 offset,
                 size,
@@ -391,15 +404,15 @@ struct Shared {
 }
 
 impl Shared {
-    fn repo(&self) -> Arc<ReadonlyRepo> {
-        self.repo_state.read().unwrap().repo.clone()
+    async fn repo(&self) -> Arc<ReadonlyRepo> {
+        self.repo_state.read().await.repo.clone()
     }
 
     async fn write_commit(&self) -> anyhow::Result<()> {
         // Construct a tree with a recent state for every open inode
         let TreeValue::Tree(id) = self
             .inodes
-            .flatten_value(&self.repo_state.read().unwrap().repo, FUSE_ROOT_ID)
+            .flatten_value(&self.repo_state.read().await.repo, FUSE_ROOT_ID)
             .await?
         else {
             // Root inode is always a tree
@@ -407,7 +420,7 @@ impl Shared {
         };
 
         // Rewrite the commit with that tree
-        let mut state = self.repo_state.write().unwrap();
+        let mut state = self.repo_state.write().await;
         let mut tx = state.repo.start_transaction();
         let new_commit = tx
             .repo_mut()
@@ -455,22 +468,22 @@ impl InodeTable {
         }
     }
 
-    fn get_path(&self, inode: Inode) -> RepoPathBuf {
+    async fn get_path(&self, inode: Inode) -> RepoPathBuf {
         self.inodes
             .read()
-            .unwrap()
+            .await
             .get(inode as usize)
             .unwrap()
             .path
             .clone()
     }
 
-    fn get_path_value(&self, inode: Inode) -> (RepoPathBuf, TreeValue) {
-        let inodes = self.inodes.read().unwrap();
+    async fn get_path_value(&self, inode: Inode) -> (RepoPathBuf, TreeValue) {
+        let inodes = self.inodes.read().await;
         let state = inodes.get(inode as usize).unwrap();
         (
             state.path.clone(),
-            state.mutable_state.read().unwrap().value.clone(),
+            state.mutable_state.read().await.value.clone(),
         )
     }
 
@@ -481,7 +494,7 @@ impl InodeTable {
         mut offset: u64,
         buf: &mut [u8],
     ) -> FsResult<usize> {
-        let (path, TreeValue::File { id, .. }) = self.get_path_value(inode) else {
+        let (path, TreeValue::File { id, .. }) = self.get_path_value(inode).await else {
             return Err(EISDIR);
         };
         let mut file = repo.store().read_file(&path, &id).await.map_err(|e| {
@@ -505,7 +518,7 @@ impl InodeTable {
     }
 
     async fn stat(&self, repo: &ReadonlyRepo, inode: Inode) -> FsResult<FileAttr> {
-        let (path, value) = self.get_path_value(inode);
+        let (path, value) = self.get_path_value(inode).await;
         let mut size = 0;
         if let TreeValue::File { id, .. } = &value {
             let meta = repo
@@ -540,9 +553,9 @@ impl InodeTable {
         let dir_path;
         let tree_id;
         {
-            let inodes = self.inodes.read().unwrap();
+            let inodes = self.inodes.read().await;
             let state = inodes.get(inode as usize).unwrap();
-            let value = state.mutable_state.read().unwrap().value.clone();
+            let value = state.mutable_state.read().await.value.clone();
             let TreeValue::Tree(id) = &value else {
                 return Err(ENOTDIR);
             };
@@ -560,7 +573,7 @@ impl InodeTable {
                         .unwrap()
                         .mutable_state
                         .read()
-                        .unwrap()
+                        .await
                         .value,
                     "..",
                     2,
@@ -596,13 +609,13 @@ impl InodeTable {
     }
 
     /// Returns `None` if not already resident
-    fn get_and_ref(&self, parent: Inode, name: &RepoPathComponent) -> Option<Inode> {
-        let inodes = self.inodes.read().unwrap();
+    async fn get_and_ref(&self, parent: Inode, name: &RepoPathComponent) -> Option<Inode> {
+        let inodes = self.inodes.read().await;
         let i = *inodes
             .get(parent as usize)?
             .mutable_state
             .read()
-            .unwrap()
+            .await
             .children
             .as_ref()?
             .get(name)?;
@@ -622,18 +635,17 @@ impl InodeTable {
         name: &RepoPathComponent,
     ) -> FsResult<Inode> {
         // Fast path
-        if let Some(i) = self.get_and_ref(parent_ino, name) {
+        if let Some(i) = self.get_and_ref(parent_ino, name).await {
             return Ok(i);
         }
 
-        let mut inodes = self.inodes.write().unwrap();
+        let mut inodes = self.inodes.write().await;
         {
             let Some(children) = &inodes
                 .get_mut(parent_ino as usize)
                 .unwrap()
                 .mutable_state
                 .get_mut()
-                .unwrap()
                 .children
             else {
                 return Err(ENOTDIR);
@@ -651,8 +663,7 @@ impl InodeTable {
 
         // Create a child inode
         let parent = inodes.get_mut(parent_ino as usize).unwrap();
-        let TreeValue::Tree(parent_tree_id) = parent.mutable_state.get_mut().unwrap().value.clone()
-        else {
+        let TreeValue::Tree(parent_tree_id) = parent.mutable_state.get_mut().value.clone() else {
             unreachable!()
         };
 
@@ -678,7 +689,6 @@ impl InodeTable {
             .unwrap()
             .mutable_state
             .get_mut()
-            .unwrap()
             .children
             .as_mut()
             .unwrap()
@@ -686,12 +696,12 @@ impl InodeTable {
         Ok(n as u64)
     }
 
-    fn forget(&self, i: Inode, nlookup: u64) {
+    async fn forget(&self, i: Inode, nlookup: u64) {
         let i = i as usize;
         let prev = self
             .inodes
             .read()
-            .unwrap()
+            .await
             .get(i)
             .unwrap()
             .references
@@ -699,7 +709,7 @@ impl InodeTable {
         if prev > nlookup {
             return;
         }
-        let mut inodes = self.inodes.write().unwrap();
+        let mut inodes = self.inodes.write().await;
         let inode = inodes.remove(i);
         trace!("deallocated inode {}, formerly {:?}", i, inode.path);
 
@@ -710,7 +720,6 @@ impl InodeTable {
                 .unwrap()
                 .mutable_state
                 .get_mut()
-                .unwrap()
                 .children
                 .as_mut()
                 .unwrap()
@@ -723,9 +732,9 @@ impl InodeTable {
     /// Obtain a `TreeValue` that independently represents a recent state of `inode`
     async fn flatten_value(&self, repo: &ReadonlyRepo, inode: Inode) -> BackendResult<TreeValue> {
         let (path, base, current_children) = {
-            let inodes = self.inodes.read().unwrap();
+            let inodes = self.inodes.read().await;
             let state = inodes.get(inode as usize).unwrap();
-            let mutable = state.mutable_state.read().unwrap();
+            let mutable = state.mutable_state.read().await;
             (
                 state.path.clone(),
                 mutable.value.clone(),
@@ -763,8 +772,8 @@ impl InodeTable {
         Ok(TreeValue::Tree(fresh_tree.id().clone()))
     }
 
-    fn insert(&self, parent: Inode, name: &RepoPathComponent, value: TreeValue) -> Inode {
-        let mut inodes = self.inodes.write().unwrap();
+    async fn insert(&self, parent: Inode, name: &RepoPathComponent, value: TreeValue) -> Inode {
+        let mut inodes = self.inodes.write().await;
         let full_path = inodes.get(parent as usize).unwrap().path.join(name);
         let mut state = InodeState::new(full_path, value);
         state.parent = Some(InodeParent {
@@ -777,7 +786,6 @@ impl InodeTable {
             .unwrap()
             .mutable_state
             .get_mut()
-            .unwrap()
             .children
             .as_mut()
             .unwrap()
