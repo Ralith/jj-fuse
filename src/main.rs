@@ -203,34 +203,25 @@ impl fractal_fuse::Filesystem for Fs {
     ) -> FsResult<usize> {
         let inodes = self.shared.inodes.inodes.read().await;
         let state = inodes.get(inode as usize).unwrap();
-        let value = &mut state.mutable_state.write().await.value;
+        let mut mutable_state = state.mutable_state.write().await;
         let TreeValue::File {
             id,
             executable,
             copy_id,
-        } = &*value
+        } = &mutable_state.value
         else {
             return Err(EISDIR);
         };
         let executable = *executable;
         let copy_id = copy_id.clone();
-        let file = self
-            .shared
-            .repo()
-            .await
-            .store()
-            .read_file(&state.path, id)
-            .await
-            .map_err(|e| {
-                error!("opening {:?}: {:#}", state.path, e);
-                EIO
-            })?;
+        let repo = self.shared.repo().await;
+        let file = repo.store().read_file(&state.path, id).await.map_err(|e| {
+            error!("opening {:?}: {:#}", state.path, e);
+            EIO
+        })?;
         trace!("opened old file {id}");
         // Create a new file with the specified data overwritten
-        let updated_file = self
-            .shared
-            .repo()
-            .await
+        let updated_file = repo
             .store()
             .write_file(
                 &state.path,
@@ -246,11 +237,24 @@ impl fractal_fuse::Filesystem for Fs {
                 EIO
             })?;
         trace!("created edited file {updated_file}");
-        *value = TreeValue::File {
+        mutable_state.value = TreeValue::File {
             id: updated_file,
             executable,
             copy_id,
         };
+        drop(mutable_state);
+
+        self.shared
+            .inodes
+            .update_trees(repo.store(), inode)
+            .await
+            .map_err(|e| {
+                error!(
+                    "updating directory metadata leading to written file {:?}: {e:#}",
+                    state.path
+                );
+                EIO
+            })?;
 
         Ok(data.len())
     }
@@ -812,6 +816,11 @@ impl InodeTable {
         update_trees_locked(&inodes, store, inode).await?;
 
         Ok(inode as u64)
+    }
+
+    async fn update_trees(&self, store: &Arc<Store>, inode: Inode) -> BackendResult<()> {
+        let inodes = self.inodes.read().await;
+        update_trees_locked(&inodes, store, inode as usize).await
     }
 }
 
