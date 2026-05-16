@@ -275,6 +275,50 @@ impl fractal_fuse::Filesystem for Fs {
         Ok(data.len())
     }
 
+    async fn symlink(
+        &self,
+        _req: Request,
+        parent: Inode,
+        name: &OsStr,
+        link: &OsStr,
+    ) -> FsResult<ReplyEntry> {
+        let parent_path = self.shared.inodes.get_path(parent);
+        let name = RepoPathComponent::new(name.to_str().ok_or_else(|| {
+            error!("non-Unicode symlink name: {name:?}");
+            EINVAL
+        })?)
+        .map_err(|e| {
+            error!("illegal symlink name: {name:?}: {e:#}");
+            EINVAL
+        })?;
+        let path = parent_path.join(name);
+        let id = self
+            .shared
+            .repo()
+            .store()
+            .write_symlink(
+                &path,
+                link.to_str().ok_or_else(|| {
+                    error!("non-Unicode symlink target: {link:?}");
+                    EINVAL
+                })?,
+            )
+            .await
+            .map_err(|e| {
+                error!("writing symlink {path:?}: {:#}", e);
+                EIO
+            })?;
+        let value = TreeValue::Symlink(id);
+        let attr = value_stat(&value);
+        let ino = self.shared.inodes.insert(parent, name, value);
+
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr: FileAttr { ino, ..attr },
+            generation: 0,
+        })
+    }
+
     async fn readlink(&self, _req: Request, inode: Inode) -> FsResult<ReplyReadlink> {
         let (path, TreeValue::Symlink(id)) = self.shared.inodes.get_path_value(inode) else {
             return Err(EINVAL);
@@ -407,6 +451,16 @@ impl InodeTable {
                 (FUSE_ROOT_ID as usize, root_inode),
             ])),
         }
+    }
+
+    fn get_path(&self, inode: Inode) -> RepoPathBuf {
+        self.inodes
+            .read()
+            .unwrap()
+            .get(inode as usize)
+            .unwrap()
+            .path
+            .clone()
     }
 
     fn get_path_value(&self, inode: Inode) -> (RepoPathBuf, TreeValue) {
@@ -705,6 +759,28 @@ impl InodeTable {
             .write_tree(&path, Tree::from_sorted_entries(fresh_children))
             .await?;
         Ok(TreeValue::Tree(fresh_tree.id().clone()))
+    }
+
+    fn insert(&self, parent: Inode, name: &RepoPathComponent, value: TreeValue) -> Inode {
+        let mut inodes = self.inodes.write().unwrap();
+        let full_path = inodes.get(parent as usize).unwrap().path.join(name);
+        let mut state = InodeState::new(full_path, value);
+        state.parent = Some(InodeParent {
+            child_name: name.to_owned(),
+            parent: parent as usize,
+        });
+        let inode = inodes.insert(state);
+        inodes
+            .get(parent as usize)
+            .unwrap()
+            .mutable_state
+            .write()
+            .unwrap()
+            .children
+            .as_mut()
+            .unwrap()
+            .insert(name.to_owned(), inode);
+        inode as u64
     }
 }
 
