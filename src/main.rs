@@ -24,6 +24,7 @@ use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::{ReadonlyRepo, Repo, StoreFactories};
 use jj_lib::repo_path::{RepoPathBuf, RepoPathComponent, RepoPathComponentBuf};
 use jj_lib::settings::UserSettings;
+use jj_lib::store::Store;
 use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use slab::Slab;
@@ -271,10 +272,8 @@ impl fractal_fuse::Filesystem for Fs {
             EINVAL
         })?;
         let path = parent_path.join(name);
-        let id = self
-            .shared
-            .repo()
-            .await
+        let repo = self.shared.repo().await;
+        let id = repo
             .store()
             .write_symlink(
                 &path,
@@ -290,7 +289,15 @@ impl fractal_fuse::Filesystem for Fs {
             })?;
         let value = TreeValue::Symlink(id);
         let attr = value_stat(&value);
-        let ino = self.shared.inodes.insert(parent, name, value).await;
+        let ino = self
+            .shared
+            .inodes
+            .insert(repo.store(), parent, name, value)
+            .await
+            .map_err(|e| {
+                error!("updating directory metadata leading to symlink {path:?}: {e:#}");
+                EIO
+            })?;
 
         self.shared.write_commit().await.map_err(|e| {
             error!("committing new symlink: {e:#}");
@@ -777,10 +784,16 @@ impl InodeTable {
         Ok(TreeValue::Tree(fresh_tree.id().clone()))
     }
 
-    async fn insert(&self, parent: Inode, name: &RepoPathComponent, value: TreeValue) -> Inode {
+    async fn insert(
+        &self,
+        store: &Arc<Store>,
+        parent: Inode,
+        name: &RepoPathComponent,
+        value: TreeValue,
+    ) -> BackendResult<Inode> {
         let mut inodes = self.inodes.write().await;
         let full_path = inodes.get(parent as usize).unwrap().path.join(name);
-        let mut state = InodeState::new(full_path, value);
+        let mut state = InodeState::new(full_path, value.clone());
         state.parent = Some(InodeParent {
             child_name: name.to_owned(),
             parent: parent as usize,
@@ -795,7 +808,57 @@ impl InodeTable {
             .as_mut()
             .unwrap()
             .insert(name.to_owned(), inode);
-        inode as u64
+
+        update_trees_locked(&inodes, store, inode).await?;
+
+        Ok(inode as u64)
+    }
+}
+
+/// Propagate a change to `inode` up to the root tree
+async fn update_trees_locked(
+    inodes: &Slab<InodeState>,
+    store: &Arc<Store>,
+    inode: usize,
+) -> BackendResult<()> {
+    let state = inodes.get(inode as usize).unwrap();
+    let Some(mut parent_info) = state.parent.clone() else {
+        // `inode` is the root; there's nowhere to propagate
+        return Ok(());
+    };
+    let mut value = state.mutable_state.read().await.value.clone();
+
+    loop {
+        let parent = inodes.get(parent_info.parent).unwrap();
+        let mut parent_state = parent.mutable_state.write().await;
+        let TreeValue::Tree(id) = &mut parent_state.value else {
+            unreachable!()
+        };
+        let tree = store.get_tree(parent.path.clone(), id).await?;
+        let mut entries = tree
+            .entries_non_recursive()
+            .map(|e| (e.name().to_owned(), e.value().clone()))
+            .collect::<Vec<_>>();
+        match entries.binary_search_by_key(&&*parent_info.child_name, |(n, _)| &*n) {
+            Ok(i) => {
+                // Replace existing entry
+                entries[i].1 = value;
+            }
+            Err(i) => {
+                // Insert new entry
+                entries.insert(i, (parent_info.child_name, value));
+            }
+        };
+        let new_tree = Tree::from_sorted_entries(entries);
+        let new_tree_id = store.write_tree(&parent.path, new_tree).await?.id().clone();
+        value = TreeValue::Tree(new_tree_id);
+        parent_state.value = value.clone();
+
+        if let Some(next) = &parent.parent {
+            parent_info = next.clone();
+        } else {
+            return Ok(());
+        }
     }
 }
 
@@ -863,6 +926,7 @@ fn value_stat(value: &TreeValue) -> FileAttr {
     }
 }
 
+#[derive(Clone)]
 struct InodeParent {
     child_name: RepoPathComponentBuf,
     parent: usize,
