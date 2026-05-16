@@ -292,6 +292,11 @@ impl fractal_fuse::Filesystem for Fs {
         let attr = value_stat(&value);
         let ino = self.shared.inodes.insert(parent, name, value).await;
 
+        self.shared.write_commit().await.map_err(|e| {
+            error!("committing new symlink: {e:#}");
+            EIO
+        })?;
+
         Ok(ReplyEntry {
             ttl: TTL,
             attr: FileAttr { ino, ..attr },
