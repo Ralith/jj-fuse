@@ -629,10 +629,10 @@ impl InodeTable {
         let mut inodes = self.inodes.write().unwrap();
         {
             let Some(children) = &inodes
-                .get(parent_ino as usize)
+                .get_mut(parent_ino as usize)
                 .unwrap()
                 .mutable_state
-                .read()
+                .get_mut()
                 .unwrap()
                 .children
             else {
@@ -650,8 +650,8 @@ impl InodeTable {
         }
 
         // Create a child inode
-        let parent = inodes.get(parent_ino as usize).unwrap();
-        let TreeValue::Tree(parent_tree_id) = parent.mutable_state.read().unwrap().value.clone()
+        let parent = inodes.get_mut(parent_ino as usize).unwrap();
+        let TreeValue::Tree(parent_tree_id) = parent.mutable_state.get_mut().unwrap().value.clone()
         else {
             unreachable!()
         };
@@ -677,7 +677,7 @@ impl InodeTable {
             .get_mut(parent_ino as usize)
             .unwrap()
             .mutable_state
-            .write()
+            .get_mut()
             .unwrap()
             .children
             .as_mut()
@@ -709,7 +709,7 @@ impl InodeTable {
                 .get_mut(parent.parent)
                 .unwrap()
                 .mutable_state
-                .write()
+                .get_mut()
                 .unwrap()
                 .children
                 .as_mut()
@@ -773,10 +773,10 @@ impl InodeTable {
         });
         let inode = inodes.insert(state);
         inodes
-            .get(parent as usize)
+            .get_mut(parent as usize)
             .unwrap()
             .mutable_state
-            .write()
+            .get_mut()
             .unwrap()
             .children
             .as_mut()
