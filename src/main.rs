@@ -105,6 +105,7 @@ impl Fs {
         };
         Ok(Self {
             shared: Arc::new(Shared {
+                store: repo.store().clone(),
                 repo_state: RwLock::new(RepoState { repo, commit }),
                 inodes: InodeTable::new(tree_id),
             }),
@@ -126,15 +127,14 @@ impl fractal_fuse::Filesystem for Fs {
         let Ok(name) = RepoPathComponent::new(name) else {
             return Err(ENOENT);
         };
-        let repo = self.shared.repo().await;
         let inode = self
             .shared
             .inodes
-            .get_or_insert_and_ref(&repo, parent, name)
+            .get_or_insert_and_ref(&self.shared.store, parent, name)
             .await?;
         Ok(ReplyEntry {
             ttl: TTL,
-            attr: self.shared.inodes.stat(&repo, inode).await?,
+            attr: self.shared.inodes.stat(&self.shared.store, inode).await?,
             generation: 0,
         })
     }
@@ -156,22 +156,13 @@ impl fractal_fuse::Filesystem for Fs {
     ) -> FsResult<ReplyAttr> {
         Ok(ReplyAttr {
             ttl: TTL,
-            attr: self
-                .shared
-                .inodes
-                .stat(&*self.shared.repo().await, inode)
-                .await?,
+            attr: self.shared.inodes.stat(&self.shared.store, inode).await?,
         })
     }
 
     async fn open(&self, _req: Request, inode: Inode, flags: u32) -> FsResult<ReplyOpen> {
         if flags & O_TRUNC as u32 != 0 {
-            if let Err(e) = self
-                .shared
-                .inodes
-                .trunc(self.shared.repo().await.store(), inode, 0)
-                .await
-            {
+            if let Err(e) = self.shared.inodes.trunc(&self.shared.store, inode, 0).await {
                 let path = self.shared.inodes.get_path(inode).await;
                 error!("truncating {path:?} for open: {e:#}");
                 return Err(EIO);
@@ -193,10 +184,10 @@ impl fractal_fuse::Filesystem for Fs {
         _flags: u32,
     ) -> FsResult<ReplyCreate> {
         let name = translate_name(name)?;
-        let repo = self.shared.repo().await;
         let path = self.shared.inodes.get_path(parent).await.join(name);
-        let id = repo
-            .store()
+        let id = self
+            .shared
+            .store
             .write_file(&path, &mut &[][..])
             .await
             .map_err(|e| {
@@ -212,7 +203,7 @@ impl fractal_fuse::Filesystem for Fs {
         let ino = self
             .shared
             .inodes
-            .insert(repo.store(), parent, name, value)
+            .insert(&self.shared.store, parent, name, value)
             .await
             .map_err(|e| {
                 error!("updating directory metadata leading file: {e:#}");
@@ -253,7 +244,7 @@ impl fractal_fuse::Filesystem for Fs {
     ) -> FsResult<usize> {
         self.shared
             .inodes
-            .read(&*self.shared.repo().await, inode, offset, buf)
+            .read(&self.shared.store, inode, offset, buf)
             .await
     }
 
@@ -280,15 +271,20 @@ impl fractal_fuse::Filesystem for Fs {
         };
         let executable = *executable;
         let copy_id = copy_id.clone();
-        let repo = self.shared.repo().await;
-        let file = repo.store().read_file(&state.path, id).await.map_err(|e| {
-            error!("opening {:?}: {:#}", state.path, e);
-            EIO
-        })?;
+        let file = self
+            .shared
+            .store
+            .read_file(&state.path, id)
+            .await
+            .map_err(|e| {
+                error!("opening {:?}: {:#}", state.path, e);
+                EIO
+            })?;
         trace!("opened old file {id}");
         // Create a new file with the specified data overwritten
-        let updated_file = repo
-            .store()
+        let updated_file = self
+            .shared
+            .store
             .write_file(
                 &state.path,
                 &mut Overwrite {
@@ -312,7 +308,7 @@ impl fractal_fuse::Filesystem for Fs {
 
         self.shared
             .inodes
-            .update_trees(repo.store(), inode)
+            .update_trees(&self.shared.store, inode)
             .await
             .map_err(|e| {
                 error!(
@@ -335,9 +331,9 @@ impl fractal_fuse::Filesystem for Fs {
         let parent_path = self.shared.inodes.get_path(parent).await;
         let name = translate_name(name)?;
         let path = parent_path.join(name);
-        let repo = self.shared.repo().await;
-        let id = repo
-            .store()
+        let id = self
+            .shared
+            .store
             .write_symlink(
                 &path,
                 link.to_str().ok_or_else(|| {
@@ -355,7 +351,7 @@ impl fractal_fuse::Filesystem for Fs {
         let ino = self
             .shared
             .inodes
-            .insert(repo.store(), parent, name, value)
+            .insert(&self.shared.store, parent, name, value)
             .await
             .map_err(|e| {
                 error!("updating directory metadata leading to symlink {path:?}: {e:#}");
@@ -380,9 +376,7 @@ impl fractal_fuse::Filesystem for Fs {
         };
         let target = self
             .shared
-            .repo()
-            .await
-            .store()
+            .store
             .read_symlink(&path, &id)
             .await
             .map_err(|e| {
@@ -405,7 +399,7 @@ impl fractal_fuse::Filesystem for Fs {
         self.shared
             .inodes
             .readdir(
-                &*self.shared.repo().await,
+                &self.shared.store,
                 inode,
                 offset,
                 size,
@@ -430,7 +424,7 @@ impl fractal_fuse::Filesystem for Fs {
         self.shared
             .inodes
             .readdir(
-                &*self.shared.repo().await,
+                &self.shared.store,
                 inode,
                 offset,
                 size,
@@ -464,13 +458,12 @@ impl fractal_fuse::Filesystem for Fs {
         _umask: u32,
     ) -> FsResult<ReplyEntry> {
         let name = translate_name(name)?;
-        let repo = self.shared.repo().await;
-        let value = TreeValue::Tree(repo.store().empty_tree_id().clone());
+        let value = TreeValue::Tree(self.shared.store.empty_tree_id().clone());
         let attr = value_stat(&value);
         let ino = self
             .shared
             .inodes
-            .insert(repo.store(), parent, name, value)
+            .insert(&self.shared.store, parent, name, value)
             .await
             .map_err(|e| {
                 error!("updating directory metadata leading to file: {e:#}");
@@ -508,15 +501,12 @@ impl fractal_fuse::Filesystem for Fs {
 }
 
 struct Shared {
+    store: Arc<Store>,
     repo_state: RwLock<RepoState>,
     inodes: InodeTable,
 }
 
 impl Shared {
-    async fn repo(&self) -> Arc<ReadonlyRepo> {
-        self.repo_state.read().await.repo.clone()
-    }
-
     async fn write_commit(&self) -> anyhow::Result<()> {
         let TreeValue::Tree(id) = self.inodes.get(FUSE_ROOT_ID).await else {
             unreachable!()
@@ -527,7 +517,7 @@ impl Shared {
         let new_commit = tx
             .repo_mut()
             .rewrite_commit(&state.commit)
-            .set_tree(MergedTree::resolved(state.repo.store().clone(), id))
+            .set_tree(MergedTree::resolved(self.store.clone(), id))
             .write()
             .await
             .context("rewriting commit")?;
@@ -604,7 +594,7 @@ impl InodeTable {
 
     async fn read(
         &self,
-        repo: &ReadonlyRepo,
+        store: &Arc<Store>,
         inode: Inode,
         mut offset: u64,
         buf: &mut [u8],
@@ -612,7 +602,7 @@ impl InodeTable {
         let (path, TreeValue::File { id, .. }) = self.get_path_value(inode).await else {
             return Err(EISDIR);
         };
-        let mut file = repo.store().read_file(&path, &id).await.map_err(|e| {
+        let mut file = store.read_file(&path, &id).await.map_err(|e| {
             error!("opening {path:?}: {:#}", e);
             EIO
         })?;
@@ -632,18 +622,14 @@ impl InodeTable {
         Ok(n)
     }
 
-    async fn stat(&self, repo: &ReadonlyRepo, inode: Inode) -> FsResult<FileAttr> {
+    async fn stat(&self, store: &Arc<Store>, inode: Inode) -> FsResult<FileAttr> {
         let (path, value) = self.get_path_value(inode).await;
         let mut size = 0;
         if let TreeValue::File { id, .. } = &value {
-            let meta = repo
-                .store()
-                .get_file_metadata(&path, &id)
-                .await
-                .map_err(|e| {
-                    error!("fetching metadata for {path:?}: {:#}", e);
-                    EIO
-                })?;
+            let meta = store.get_file_metadata(&path, &id).await.map_err(|e| {
+                error!("fetching metadata for {path:?}: {:#}", e);
+                EIO
+            })?;
             size = meta.size;
         };
         Ok(FileAttr {
@@ -655,7 +641,7 @@ impl InodeTable {
 
     async fn readdir<T, F>(
         &self,
-        repo: &ReadonlyRepo,
+        store: &Arc<Store>,
         inode: Inode,
         offset: u64,
         size: u32,
@@ -695,8 +681,7 @@ impl InodeTable {
                 ));
             }
         }
-        let tree = repo
-            .store()
+        let tree = store
             .get_tree(dir_path.clone(), &tree_id)
             .await
             .map_err(|e| {
@@ -745,7 +730,7 @@ impl InodeTable {
     /// Returns `None` if no such file
     async fn get_or_insert_and_ref(
         &self,
-        repo: &ReadonlyRepo,
+        store: &Arc<Store>,
         parent_ino: Inode,
         name: &RepoPathComponent,
     ) -> FsResult<Inode> {
@@ -783,8 +768,7 @@ impl InodeTable {
         };
 
         let child_path = parent.path.join(name);
-        let parent_tree = repo
-            .store()
+        let parent_tree = store
             .get_tree(parent.path.clone(), &parent_tree_id)
             .await
             .map_err(|e| {
