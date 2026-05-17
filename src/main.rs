@@ -437,6 +437,40 @@ impl fractal_fuse::Filesystem for Fs {
         })
     }
 
+    async fn unlink(&self, _req: Request, parent: Inode, name: &OsStr) -> FsResult<()> {
+        let name = translate_name(name)?;
+        if let Err(e) = self.shared.remove(parent, name).await {
+            let path = self.shared.get_path(parent).await.join(name);
+            error!("removing {path:?}: {e:#}");
+            return Err(EIO);
+        }
+
+        if let Err(e) = self.shared.write_commit().await {
+            let path = self.shared.get_path(parent).await.join(name);
+            error!("committing removal of {path:?}: {e:#}");
+            return Err(EIO);
+        }
+
+        Ok(())
+    }
+
+    async fn rmdir(&self, _req: Request, parent: Inode, name: &OsStr) -> FsResult<()> {
+        let name = translate_name(name)?;
+        if let Err(e) = self.shared.remove(parent, name).await {
+            let path = self.shared.get_path(parent).await.join(name);
+            error!("removing {path:?}: {e:#}");
+            return Err(EIO);
+        }
+
+        if let Err(e) = self.shared.write_commit().await {
+            let path = self.shared.get_path(parent).await.join(name);
+            error!("committing removal of {path:?}: {e:#}");
+            return Err(EIO);
+        }
+
+        Ok(())
+    }
+
     async fn statfs(&self, _req: Request, _inode: u64) -> FsResult<ReplyStatfs> {
         Ok(ReplyStatfs {
             blocks: 0,
@@ -801,6 +835,33 @@ impl Shared {
         update_trees_locked(&inodes, &self.store, inode).await?;
 
         Ok(inode as u64)
+    }
+
+    async fn remove(&self, parent: Inode, name: &RepoPathComponent) -> BackendResult<()> {
+        let inodes = self.inodes.read().await;
+        let state = inodes.get(parent as usize).unwrap();
+        // Hold a write lock for the duration so racing metadata ops don't lose data
+        let mut mutable = state.mutable_state.write().await;
+        let TreeValue::Tree(id) = &mut mutable.value else {
+            unreachable!()
+        };
+        let tree = self.store.get_tree(state.path.clone(), id).await?;
+        let entries = tree
+            .entries_non_recursive()
+            .filter(|e| e.name() != name)
+            .map(|e| (e.name().to_owned(), e.value().clone()))
+            .collect();
+        let new_tree = Tree::from_sorted_entries(entries);
+        *id = self
+            .store
+            .write_tree(&state.path, new_tree)
+            .await?
+            .id()
+            .clone();
+
+        update_trees_locked(&inodes, &self.store, parent as usize).await?;
+
+        Ok(())
     }
 
     async fn update_trees(&self, inode: Inode) -> BackendResult<()> {
