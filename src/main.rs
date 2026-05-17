@@ -41,7 +41,7 @@ struct Args {
 fn main() -> ExitCode {
     tracing_subscriber::fmt::init();
     if let Err(e) = run() {
-        eprintln!("{:#}", e);
+        error!("{:#}", e);
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
