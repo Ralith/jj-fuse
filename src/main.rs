@@ -18,7 +18,7 @@ use fractal_fuse::{
 };
 use futures_util::AsyncRead;
 use futures_util::io::AsyncReadExt;
-use jj_lib::backend::{BackendResult, CopyId, Tree, TreeId, TreeValue};
+use jj_lib::backend::{BackendResult, CopyId, Tree, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::ref_name::WorkspaceName;
@@ -100,15 +100,8 @@ impl Fs {
             .get_commit_async(commit_id)
             .await
             .context("reading commit")?;
-        let Some(tree_id) = commit.tree_ids().as_resolved().cloned() else {
-            bail!("conflicted trees are not implemented");
-        };
         Ok(Self {
-            shared: Arc::new(Shared {
-                store: repo.store().clone(),
-                repo_state: RwLock::new(RepoState { repo, commit }),
-                inodes: InodeTable::new(tree_id),
-            }),
+            shared: Arc::new(Shared::new(repo, commit)?),
         })
     }
 }
@@ -127,14 +120,10 @@ impl fractal_fuse::Filesystem for Fs {
         let Ok(name) = RepoPathComponent::new(name) else {
             return Err(ENOENT);
         };
-        let inode = self
-            .shared
-            .inodes
-            .get_or_insert_and_ref(&self.shared.store, parent, name)
-            .await?;
+        let inode = self.shared.get_or_insert_and_ref(parent, name).await?;
         Ok(ReplyEntry {
             ttl: TTL,
-            attr: self.shared.inodes.stat(&self.shared.store, inode).await?,
+            attr: self.shared.stat(inode).await?,
             generation: 0,
         })
     }
@@ -142,7 +131,7 @@ impl fractal_fuse::Filesystem for Fs {
     fn forget(&self, _: Request, inode: Inode, nlookup: u64) {
         let shared = self.shared.clone();
         compio_runtime::spawn(async move {
-            shared.inodes.forget(inode, nlookup).await;
+            shared.forget(inode, nlookup).await;
         })
         .detach();
     }
@@ -156,14 +145,14 @@ impl fractal_fuse::Filesystem for Fs {
     ) -> FsResult<ReplyAttr> {
         Ok(ReplyAttr {
             ttl: TTL,
-            attr: self.shared.inodes.stat(&self.shared.store, inode).await?,
+            attr: self.shared.stat(inode).await?,
         })
     }
 
     async fn open(&self, _req: Request, inode: Inode, flags: u32) -> FsResult<ReplyOpen> {
         if flags & O_TRUNC as u32 != 0 {
-            if let Err(e) = self.shared.inodes.trunc(&self.shared.store, inode, 0).await {
-                let path = self.shared.inodes.get_path(inode).await;
+            if let Err(e) = self.shared.trunc(inode, 0).await {
+                let path = self.shared.get_path(inode).await;
                 error!("truncating {path:?} for open: {e:#}");
                 return Err(EIO);
             }
@@ -184,7 +173,7 @@ impl fractal_fuse::Filesystem for Fs {
         _flags: u32,
     ) -> FsResult<ReplyCreate> {
         let name = translate_name(name)?;
-        let path = self.shared.inodes.get_path(parent).await.join(name);
+        let path = self.shared.get_path(parent).await.join(name);
         let id = self
             .shared
             .store
@@ -200,15 +189,10 @@ impl fractal_fuse::Filesystem for Fs {
             copy_id: CopyId::placeholder(), // ???
         };
         let attr = value_stat(&value);
-        let ino = self
-            .shared
-            .inodes
-            .insert(&self.shared.store, parent, name, value)
-            .await
-            .map_err(|e| {
-                error!("updating directory metadata leading file: {e:#}");
-                EIO
-            })?;
+        let ino = self.shared.insert(parent, name, value).await.map_err(|e| {
+            error!("updating directory metadata leading file: {e:#}");
+            EIO
+        })?;
         Ok(ReplyCreate {
             ttl: TTL,
             attr: FileAttr { ino, ..attr },
@@ -242,10 +226,7 @@ impl fractal_fuse::Filesystem for Fs {
         offset: u64,
         buf: &mut [u8],
     ) -> FsResult<usize> {
-        self.shared
-            .inodes
-            .read(&self.shared.store, inode, offset, buf)
-            .await
+        self.shared.read(inode, offset, buf).await
     }
 
     async fn write(
@@ -258,7 +239,7 @@ impl fractal_fuse::Filesystem for Fs {
         _write_flags: u32,
         _flags: u32,
     ) -> FsResult<usize> {
-        let inodes = self.shared.inodes.inodes.read().await;
+        let inodes = self.shared.inodes.read().await;
         let state = inodes.get(inode as usize).unwrap();
         let mut mutable_state = state.mutable_state.write().await;
         let TreeValue::File {
@@ -306,17 +287,13 @@ impl fractal_fuse::Filesystem for Fs {
         };
         drop(mutable_state);
 
-        self.shared
-            .inodes
-            .update_trees(&self.shared.store, inode)
-            .await
-            .map_err(|e| {
-                error!(
-                    "updating directory metadata leading to written file {:?}: {e:#}",
-                    state.path
-                );
-                EIO
-            })?;
+        self.shared.update_trees(inode).await.map_err(|e| {
+            error!(
+                "updating directory metadata leading to written file {:?}: {e:#}",
+                state.path
+            );
+            EIO
+        })?;
 
         Ok(data.len())
     }
@@ -328,7 +305,7 @@ impl fractal_fuse::Filesystem for Fs {
         name: &OsStr,
         link: &OsStr,
     ) -> FsResult<ReplyEntry> {
-        let parent_path = self.shared.inodes.get_path(parent).await;
+        let parent_path = self.shared.get_path(parent).await;
         let name = translate_name(name)?;
         let path = parent_path.join(name);
         let id = self
@@ -348,15 +325,10 @@ impl fractal_fuse::Filesystem for Fs {
             })?;
         let value = TreeValue::Symlink(id);
         let attr = value_stat(&value);
-        let ino = self
-            .shared
-            .inodes
-            .insert(&self.shared.store, parent, name, value)
-            .await
-            .map_err(|e| {
-                error!("updating directory metadata leading to symlink {path:?}: {e:#}");
-                EIO
-            })?;
+        let ino = self.shared.insert(parent, name, value).await.map_err(|e| {
+            error!("updating directory metadata leading to symlink {path:?}: {e:#}");
+            EIO
+        })?;
 
         self.shared.write_commit().await.map_err(|e| {
             error!("committing new symlink: {e:#}");
@@ -371,7 +343,7 @@ impl fractal_fuse::Filesystem for Fs {
     }
 
     async fn readlink(&self, _req: Request, inode: Inode) -> FsResult<ReplyReadlink> {
-        let (path, TreeValue::Symlink(id)) = self.shared.inodes.get_path_value(inode).await else {
+        let (path, TreeValue::Symlink(id)) = self.shared.get_path_value(inode).await else {
             return Err(EINVAL);
         };
         let target = self
@@ -397,19 +369,12 @@ impl fractal_fuse::Filesystem for Fs {
         size: u32,
     ) -> FsResult<Vec<DirectoryEntry>> {
         self.shared
-            .inodes
-            .readdir(
-                &self.shared.store,
-                inode,
+            .readdir(inode, offset, size, |value, name, offset| DirectoryEntry {
+                ino: 0,
                 offset,
-                size,
-                |value, name, offset| DirectoryEntry {
-                    ino: 0,
-                    offset,
-                    kind: value_ty(value),
-                    name: name.as_bytes().to_vec(),
-                },
-            )
+                kind: value_ty(value),
+                name: name.as_bytes().to_vec(),
+            })
             .await
     }
 
@@ -422,13 +387,8 @@ impl fractal_fuse::Filesystem for Fs {
         size: u32,
     ) -> FsResult<Vec<DirectoryEntryPlus>> {
         self.shared
-            .inodes
-            .readdir(
-                &self.shared.store,
-                inode,
-                offset,
-                size,
-                |value, name, offset| DirectoryEntryPlus {
+            .readdir(inode, offset, size, |value, name, offset| {
+                DirectoryEntryPlus {
                     ino: 0,
                     offset,
                     kind: value_ty(value),
@@ -436,8 +396,8 @@ impl fractal_fuse::Filesystem for Fs {
                     entry_ttl: TTL,
                     attr: value_stat(value),
                     generation: 0,
-                },
-            )
+                }
+            })
             .await
     }
 
@@ -460,15 +420,10 @@ impl fractal_fuse::Filesystem for Fs {
         let name = translate_name(name)?;
         let value = TreeValue::Tree(self.shared.store.empty_tree_id().clone());
         let attr = value_stat(&value);
-        let ino = self
-            .shared
-            .inodes
-            .insert(&self.shared.store, parent, name, value)
-            .await
-            .map_err(|e| {
-                error!("updating directory metadata leading to file: {e:#}");
-                EIO
-            })?;
+        let ino = self.shared.insert(parent, name, value).await.map_err(|e| {
+            error!("updating directory metadata leading to directory: {e:#}");
+            EIO
+        })?;
 
         self.shared.write_commit().await.map_err(|e| {
             error!("committing new directory: {e:#}");
@@ -503,12 +458,31 @@ impl fractal_fuse::Filesystem for Fs {
 struct Shared {
     store: Arc<Store>,
     repo_state: RwLock<RepoState>,
-    inodes: InodeTable,
+    inodes: RwLock<Slab<InodeState>>,
 }
 
 impl Shared {
+    fn new(repo: Arc<ReadonlyRepo>, commit: Commit) -> anyhow::Result<Self> {
+        let Some(root_id) = commit.tree_ids().as_resolved().cloned() else {
+            bail!("conflicted trees are not implemented");
+        };
+        let root_inode = InodeState::new(RepoPathBuf::root(), TreeValue::Tree(root_id.clone()));
+        Ok(Self {
+            store: repo.store().clone(),
+            repo_state: RwLock::new(RepoState { repo, commit }),
+            inodes: RwLock::new(Slab::from_iter([
+                // Dummy inode to reserve slot 0
+                (
+                    0,
+                    InodeState::new(RepoPathBuf::root(), TreeValue::Tree(root_id)),
+                ),
+                (FUSE_ROOT_ID as usize, root_inode),
+            ])),
+        })
+    }
+
     async fn write_commit(&self) -> anyhow::Result<()> {
-        let TreeValue::Tree(id) = self.inodes.get(FUSE_ROOT_ID).await else {
+        let TreeValue::Tree(id) = self.get(FUSE_ROOT_ID).await else {
             unreachable!()
         };
         // Rewrite the commit with the current tree
@@ -532,32 +506,6 @@ impl Shared {
             .await
             .context("committing transaction")?;
         Ok(())
-    }
-}
-
-/// Identifies the committed state a VFS view is based on
-struct RepoState {
-    repo: Arc<ReadonlyRepo>,
-    commit: Commit,
-}
-
-struct InodeTable {
-    inodes: RwLock<Slab<InodeState>>,
-}
-
-impl InodeTable {
-    fn new(root_id: TreeId) -> Self {
-        let root_inode = InodeState::new(RepoPathBuf::root(), TreeValue::Tree(root_id.clone()));
-        Self {
-            inodes: RwLock::new(Slab::from_iter([
-                // Dummy inode to reserve slot 0
-                (
-                    0,
-                    InodeState::new(RepoPathBuf::root(), TreeValue::Tree(root_id)),
-                ),
-                (FUSE_ROOT_ID as usize, root_inode),
-            ])),
-        }
     }
 
     async fn get(&self, inode: Inode) -> TreeValue {
@@ -592,17 +540,11 @@ impl InodeTable {
         )
     }
 
-    async fn read(
-        &self,
-        store: &Arc<Store>,
-        inode: Inode,
-        mut offset: u64,
-        buf: &mut [u8],
-    ) -> FsResult<usize> {
+    async fn read(&self, inode: Inode, mut offset: u64, buf: &mut [u8]) -> FsResult<usize> {
         let (path, TreeValue::File { id, .. }) = self.get_path_value(inode).await else {
             return Err(EISDIR);
         };
-        let mut file = store.read_file(&path, &id).await.map_err(|e| {
+        let mut file = self.store.read_file(&path, &id).await.map_err(|e| {
             error!("opening {path:?}: {:#}", e);
             EIO
         })?;
@@ -622,14 +564,18 @@ impl InodeTable {
         Ok(n)
     }
 
-    async fn stat(&self, store: &Arc<Store>, inode: Inode) -> FsResult<FileAttr> {
+    async fn stat(&self, inode: Inode) -> FsResult<FileAttr> {
         let (path, value) = self.get_path_value(inode).await;
         let mut size = 0;
         if let TreeValue::File { id, .. } = &value {
-            let meta = store.get_file_metadata(&path, &id).await.map_err(|e| {
-                error!("fetching metadata for {path:?}: {:#}", e);
-                EIO
-            })?;
+            let meta = self
+                .store
+                .get_file_metadata(&path, &id)
+                .await
+                .map_err(|e| {
+                    error!("fetching metadata for {path:?}: {:#}", e);
+                    EIO
+                })?;
             size = meta.size;
         };
         Ok(FileAttr {
@@ -641,7 +587,6 @@ impl InodeTable {
 
     async fn readdir<T, F>(
         &self,
-        store: &Arc<Store>,
         inode: Inode,
         offset: u64,
         size: u32,
@@ -681,7 +626,8 @@ impl InodeTable {
                 ));
             }
         }
-        let tree = store
+        let tree = self
+            .store
             .get_tree(dir_path.clone(), &tree_id)
             .await
             .map_err(|e| {
@@ -730,7 +676,6 @@ impl InodeTable {
     /// Returns `None` if no such file
     async fn get_or_insert_and_ref(
         &self,
-        store: &Arc<Store>,
         parent_ino: Inode,
         name: &RepoPathComponent,
     ) -> FsResult<Inode> {
@@ -768,7 +713,8 @@ impl InodeTable {
         };
 
         let child_path = parent.path.join(name);
-        let parent_tree = store
+        let parent_tree = self
+            .store
             .get_tree(parent.path.clone(), &parent_tree_id)
             .await
             .map_err(|e| {
@@ -830,7 +776,6 @@ impl InodeTable {
 
     async fn insert(
         &self,
-        store: &Arc<Store>,
         parent: Inode,
         name: &RepoPathComponent,
         value: TreeValue,
@@ -853,17 +798,17 @@ impl InodeTable {
             .unwrap()
             .insert(name.to_owned(), inode);
 
-        update_trees_locked(&inodes, store, inode).await?;
+        update_trees_locked(&inodes, &self.store, inode).await?;
 
         Ok(inode as u64)
     }
 
-    async fn update_trees(&self, store: &Arc<Store>, inode: Inode) -> BackendResult<()> {
+    async fn update_trees(&self, inode: Inode) -> BackendResult<()> {
         let inodes = self.inodes.read().await;
-        update_trees_locked(&inodes, store, inode as usize).await
+        update_trees_locked(&inodes, &self.store, inode as usize).await
     }
 
-    async fn trunc(&self, store: &Arc<Store>, inode: Inode, size: u64) -> BackendResult<()> {
+    async fn trunc(&self, inode: Inode, size: u64) -> BackendResult<()> {
         let inodes = self.inodes.read().await;
         let state = inodes.get(inode as usize).unwrap();
         let mut mutable = state.mutable_state.write().await;
@@ -872,20 +817,26 @@ impl InodeTable {
         };
         *id = match size {
             // Fast path
-            0 => store.write_file(&state.path, &mut &[][..]).await?,
+            0 => self.store.write_file(&state.path, &mut &[][..]).await?,
             _ => {
-                let orig = store.read_file(&state.path, id).await?;
+                let orig = self.store.read_file(&state.path, id).await?;
                 let mut truncated = Truncate {
                     inner: orig,
                     remaining: size,
                 };
-                store.write_file(&state.path, &mut truncated).await?
+                self.store.write_file(&state.path, &mut truncated).await?
             }
         };
         drop(mutable);
-        update_trees_locked(&inodes, store, inode as usize).await?;
+        update_trees_locked(&inodes, &self.store, inode as usize).await?;
         Ok(())
     }
+}
+
+/// Identifies the committed state a VFS view is based on
+struct RepoState {
+    repo: Arc<ReadonlyRepo>,
+    commit: Commit,
 }
 
 pin_project! {
