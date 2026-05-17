@@ -1,5 +1,7 @@
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -56,7 +58,7 @@ fn run() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new().context("initializing tokio")?;
     trace!("opening repository");
     let fs = rt
-        .block_on(Fs::new(&args.repository))
+        .block_on(Fs::new(&args.repository, &args.mountpoint))
         .context("opening repository")?;
     let shared = fs.shared.clone();
     trace!("mounting");
@@ -86,7 +88,7 @@ struct Fs {
 }
 
 impl Fs {
-    async fn new(path: &Path) -> anyhow::Result<Self> {
+    async fn new(path: &Path, underlying_dir: &Path) -> anyhow::Result<Self> {
         let path = path.join(".jj/repo");
         let mut cfg = jj_lib::config::StackedConfig::with_defaults();
         cfg.load_dir(jj_lib::config::ConfigSource::Repo, &path)?;
@@ -106,8 +108,11 @@ impl Fs {
             .get_commit_async(commit_id)
             .await
             .context("reading commit")?;
+
+        let underlying_dir = File::open(underlying_dir).context("opening underlying directory")?;
+
         Ok(Self {
-            shared: Arc::new(Shared::new(repo, commit)?),
+            shared: Arc::new(Shared::new(repo, commit, underlying_dir.into())?),
         })
     }
 }
@@ -696,10 +701,15 @@ struct Shared {
     store: Arc<Store>,
     repo_state: RwLock<RepoState>,
     inodes: RwLock<Slab<InodeState>>,
+    underlying_dir: OwnedFd,
 }
 
 impl Shared {
-    fn new(repo: Arc<ReadonlyRepo>, commit: Commit) -> anyhow::Result<Self> {
+    fn new(
+        repo: Arc<ReadonlyRepo>,
+        commit: Commit,
+        underlying_dir: OwnedFd,
+    ) -> anyhow::Result<Self> {
         let Some(root_id) = commit.tree_ids().as_resolved().cloned() else {
             bail!("conflicted trees are not implemented");
         };
@@ -715,6 +725,7 @@ impl Shared {
                 ),
                 (FUSE_ROOT_ID as usize, root_inode),
             ])),
+            underlying_dir,
         })
     }
 
