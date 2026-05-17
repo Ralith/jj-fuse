@@ -56,12 +56,12 @@ fn run() -> anyhow::Result<()> {
         .context("opening repository")?;
     let shared = fs.shared.clone();
     trace!("mounting");
-    fractal_fuse::Session::new(args.mountpoint, MountOptions::new().fs_name("jj"))?
+    let result = fractal_fuse::Session::new(args.mountpoint, MountOptions::new().fs_name("jj"))
         .queue_depth(128)
-        .run(fs)?;
+        .run(fs);
     rt.block_on(shared.write_commit())
         .context("committing final state")?;
-    Ok(())
+    Ok(result?)
 }
 
 struct Fs {
