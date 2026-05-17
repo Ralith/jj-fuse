@@ -12,9 +12,9 @@ use anyhow::{Context, anyhow, bail};
 use clap::Parser;
 use fractal_fuse::abi::FUSE_ROOT_ID;
 use fractal_fuse::{
-    DirectoryEntry, DirectoryEntryPlus, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, FileAttr, FileType,
-    FsResult, Inode, MountOptions, ReplyAttr, ReplyCreate, ReplyEntry, ReplyOpen, ReplyReadlink,
-    ReplyStatfs, Request, Timestamp,
+    DirectoryEntry, DirectoryEntryPlus, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, FileAttr,
+    FileType, FsResult, Inode, MountOptions, ReplyAttr, ReplyCreate, ReplyEntry, ReplyOpen,
+    ReplyReadlink, ReplyStatfs, Request, Timestamp,
 };
 use futures_util::AsyncRead;
 use futures_util::io::AsyncReadExt;
@@ -26,7 +26,7 @@ use jj_lib::repo::{ReadonlyRepo, Repo, StoreFactories};
 use jj_lib::repo_path::{RepoPathBuf, RepoPathComponent, RepoPathComponentBuf};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
-use libc::O_TRUNC;
+use libc::{O_TRUNC, RENAME_EXCHANGE, RENAME_NOREPLACE};
 use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use slab::Slab;
@@ -467,6 +467,171 @@ impl fractal_fuse::Filesystem for Fs {
             error!("committing removal of {path:?}: {e:#}");
             return Err(EIO);
         }
+
+        Ok(())
+    }
+
+    async fn rename(
+        &self,
+        _req: Request,
+        parent: Inode,
+        name: &OsStr,
+        new_parent: Inode,
+        new_name: &OsStr,
+        flags: u32,
+    ) -> FsResult<()> {
+        let name = translate_name(name)?;
+        let new_name = translate_name(new_name)?;
+        let mut inodes = self.shared.inodes.write().await; // Write lock for atomicity
+
+        // Read target side
+        let orig_dst_tree;
+        let prev_value;
+        {
+            let new_parent_state = inodes.get_mut(new_parent as usize).unwrap();
+            let new_mutable = new_parent_state.mutable_state.get_mut();
+            let TreeValue::Tree(id) = &new_mutable.value else {
+                unreachable!()
+            };
+
+            orig_dst_tree = self
+                .shared
+                .store
+                .get_tree(new_parent_state.path.clone(), id)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "accessing tree at {:?} for rename: {e:#}",
+                        new_parent_state.path
+                    );
+                    EIO
+                })?;
+            prev_value = orig_dst_tree.value(new_name);
+
+            if flags & RENAME_NOREPLACE != 0 && prev_value.is_some() {
+                return Err(EEXIST);
+            }
+        }
+
+        // Read source side
+        let mut orig_src_tree;
+        let inode = {
+            let parent_state = inodes.get_mut(parent as usize).unwrap();
+            let mutable = parent_state.mutable_state.get_mut();
+            let TreeValue::Tree(id) = &mutable.value else {
+                unreachable!()
+            };
+            orig_src_tree = self
+                .shared
+                .store
+                .get_tree(parent_state.path.clone(), id)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "accessing tree at {:?} for rename: {e:#}",
+                        parent_state.path
+                    );
+                    EIO
+                })?;
+
+            mutable.children.as_mut().unwrap().remove(name).unwrap()
+        };
+
+        // Write target side
+        let prev_inode;
+        {
+            let new_parent_state = inodes.get_mut(new_parent as usize).unwrap();
+            let new_mutable = new_parent_state.mutable_state.get_mut();
+
+            // Write inode
+            prev_inode = new_mutable
+                .children
+                .as_mut()
+                .unwrap()
+                .insert(new_name.to_owned(), inode);
+
+            // Write tree entry
+            let updated_dst_tree = tree_insert(
+                &orig_dst_tree,
+                new_name,
+                orig_src_tree.value(name).unwrap().clone(),
+            );
+            let updated_dst_tree = self
+                .shared
+                .store
+                .write_tree(&new_parent_state.path, updated_dst_tree)
+                .await
+                .map_err(|e| {
+                    error!("updating tree {:?} for rename: {e:#}", orig_dst_tree.dir());
+                    EIO
+                })?;
+            new_mutable.value = TreeValue::Tree(updated_dst_tree.id().clone());
+            // Don't clobber the new file if this is a rename within the same dir
+            if parent == new_parent {
+                orig_src_tree = updated_dst_tree;
+            }
+        };
+
+        // Write source side
+        {
+            let parent_state = inodes.get_mut(parent as usize).unwrap();
+            let mutable = parent_state.mutable_state.get_mut();
+            if flags & RENAME_EXCHANGE != 0
+                && let Some(prev_inode) = prev_inode
+            {
+                mutable
+                    .children
+                    .as_mut()
+                    .unwrap()
+                    .insert(name.to_owned(), prev_inode);
+            }
+            let updated_src_tree = match (flags & RENAME_EXCHANGE != 0, prev_value) {
+                (true, Some(prev_value)) => tree_insert(&orig_src_tree, name, prev_value.clone()),
+                _ => tree_remove(&orig_src_tree, name),
+            };
+            let updated_src_tree = self
+                .shared
+                .store
+                .write_tree(&parent_state.path, updated_src_tree)
+                .await
+                .map_err(|e| {
+                    error!("updating tree {:?} for rename: {e:#}", orig_src_tree.dir());
+                    EIO
+                })?;
+            mutable.value = TreeValue::Tree(updated_src_tree.id().clone());
+        }
+
+        update_trees_locked(&inodes, &self.shared.store, parent as usize)
+            .await
+            .map_err(|e| {
+                error!(
+                    "updating directory metadata leading to rename from {:?}: {e:#}",
+                    orig_src_tree.dir().join(name)
+                );
+                EIO
+            })?;
+
+        if parent != new_parent {
+            update_trees_locked(&inodes, &self.shared.store, new_parent as usize)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "updating directory metadata leading to rename to {:?}: {e:#}",
+                        orig_dst_tree.dir().join(new_name)
+                    );
+                    EIO
+                })?;
+        }
+
+        drop(inodes);
+        self.shared.write_commit().await.map_err(|e| {
+            error!(
+                "committing rename from {:?} to {:?}: {e:#}",
+                orig_src_tree.dir().join(name),
+                orig_dst_tree.dir().join(new_name)
+            );
+            EIO
+        })?;
 
         Ok(())
     }
