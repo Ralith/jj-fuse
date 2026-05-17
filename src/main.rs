@@ -290,14 +290,7 @@ impl fractal_fuse::Filesystem for Fs {
         link: &OsStr,
     ) -> FsResult<ReplyEntry> {
         let parent_path = self.shared.inodes.get_path(parent).await;
-        let name = RepoPathComponent::new(name.to_str().ok_or_else(|| {
-            error!("non-Unicode symlink name: {name:?}");
-            EINVAL
-        })?)
-        .map_err(|e| {
-            error!("illegal symlink name: {name:?}: {e:#}");
-            EINVAL
-        })?;
+        let name = translate_name(name)?;
         let path = parent_path.join(name);
         let repo = self.shared.repo().await;
         let id = repo
@@ -1020,6 +1013,17 @@ impl<T: AsyncRead> AsyncRead for Overwrite<'_, T> {
         *this.data = remaining;
         Poll::Ready(Ok(overflow))
     }
+}
+
+fn translate_name(name: &OsStr) -> FsResult<&RepoPathComponent> {
+    Ok(RepoPathComponent::new(name.to_str().ok_or_else(|| {
+        error!("non-Unicode name: {name:?}");
+        EINVAL
+    })?)
+    .map_err(|e| {
+        error!("illegal name: {name:?}: {e:#}");
+        EINVAL
+    })?)
 }
 
 const TTL: Duration = Duration::from_secs(60);
