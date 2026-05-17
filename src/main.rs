@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -57,11 +58,20 @@ fn run() -> anyhow::Result<()> {
     let shared = fs.shared.clone();
     trace!("mounting");
     let result = fractal_fuse::Session::new(args.mountpoint, MountOptions::new().fs_name("jj"))
+        .context("mounting")?
         .queue_depth(128)
         .run(fs);
     rt.block_on(shared.write_commit())
         .context("committing final state")?;
-    Ok(result?)
+    if let Err(e) = result {
+        if e.kind() == io::ErrorKind::Unsupported {
+            bail!(
+                "initializing FUSE: {e:#} -- try `echo Y | sudo tee /sys/module/fuse/parameters/enable_uring`"
+            );
+        }
+        return Err(e).context("initializing FUSE");
+    }
+    Ok(())
 }
 
 struct Fs {
