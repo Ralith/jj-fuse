@@ -846,12 +846,7 @@ impl Shared {
             unreachable!()
         };
         let tree = self.store.get_tree(state.path.clone(), id).await?;
-        let entries = tree
-            .entries_non_recursive()
-            .filter(|e| e.name() != name)
-            .map(|e| (e.name().to_owned(), e.value().clone()))
-            .collect();
-        let new_tree = Tree::from_sorted_entries(entries);
+        let new_tree = tree_remove(&tree, name);
         *id = self
             .store
             .write_tree(&state.path, new_tree)
@@ -954,21 +949,7 @@ async fn update_trees_locked(
             unreachable!()
         };
         let tree = store.get_tree(parent.path.clone(), id).await?;
-        let mut entries = tree
-            .entries_non_recursive()
-            .map(|e| (e.name().to_owned(), e.value().clone()))
-            .collect::<Vec<_>>();
-        match entries.binary_search_by_key(&&*parent_info.child_name, |(n, _)| &*n) {
-            Ok(i) => {
-                // Replace existing entry
-                entries[i].1 = value;
-            }
-            Err(i) => {
-                // Insert new entry
-                entries.insert(i, (parent_info.child_name, value));
-            }
-        };
-        let new_tree = Tree::from_sorted_entries(entries);
+        let new_tree = tree_insert(&tree, &parent_info.child_name, value);
         let new_tree_id = store.write_tree(&parent.path, new_tree).await?.id().clone();
         value = TreeValue::Tree(new_tree_id);
         parent_state.value = value.clone();
@@ -979,6 +960,33 @@ async fn update_trees_locked(
             return Ok(());
         }
     }
+}
+
+fn tree_insert(tree: &jj_lib::tree::Tree, name: &RepoPathComponent, value: TreeValue) -> Tree {
+    let mut entries = tree
+        .entries_non_recursive()
+        .map(|e| (e.name().to_owned(), e.value().clone()))
+        .collect::<Vec<_>>();
+    match entries.binary_search_by_key(&name, |(n, _)| &*n) {
+        Ok(i) => {
+            // Replace existing entry
+            entries[i].1 = value;
+        }
+        Err(i) => {
+            // Insert new entry
+            entries.insert(i, (name.to_owned(), value));
+        }
+    };
+    Tree::from_sorted_entries(entries)
+}
+
+fn tree_remove(tree: &jj_lib::tree::Tree, name: &RepoPathComponent) -> Tree {
+    let entries = tree
+        .entries_non_recursive()
+        .filter(|e| e.name() != name)
+        .map(|e| (e.name().to_owned(), e.value().clone()))
+        .collect();
+    Tree::from_sorted_entries(entries)
 }
 
 struct InodeState {
