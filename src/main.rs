@@ -26,6 +26,7 @@ use jj_lib::repo::{ReadonlyRepo, Repo, StoreFactories};
 use jj_lib::repo_path::{RepoPathBuf, RepoPathComponent, RepoPathComponentBuf};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
+use libc::O_TRUNC;
 use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use slab::Slab;
@@ -163,7 +164,19 @@ impl fractal_fuse::Filesystem for Fs {
         })
     }
 
-    async fn open(&self, _req: Request, _inode: Inode, _flags: u32) -> FsResult<ReplyOpen> {
+    async fn open(&self, _req: Request, inode: Inode, flags: u32) -> FsResult<ReplyOpen> {
+        if flags & O_TRUNC as u32 != 0 {
+            if let Err(e) = self
+                .shared
+                .inodes
+                .trunc(self.shared.repo().await.store(), inode, 0)
+                .await
+            {
+                let path = self.shared.inodes.get_path(inode).await;
+                error!("truncating {path:?} for open: {e:#}");
+                return Err(EIO);
+            }
+        }
         Ok(ReplyOpen {
             fh: 0,
             flags: 0,
@@ -794,6 +807,64 @@ impl InodeTable {
     async fn update_trees(&self, store: &Arc<Store>, inode: Inode) -> BackendResult<()> {
         let inodes = self.inodes.read().await;
         update_trees_locked(&inodes, store, inode as usize).await
+    }
+
+    async fn trunc(&self, store: &Arc<Store>, inode: Inode, size: u64) -> BackendResult<()> {
+        let inodes = self.inodes.read().await;
+        let state = inodes.get(inode as usize).unwrap();
+        let mut mutable = state.mutable_state.write().await;
+        let TreeValue::File { id, .. } = &mut mutable.value else {
+            unreachable!()
+        };
+        *id = match size {
+            // Fast path
+            0 => store.write_file(&state.path, &mut &[][..]).await?,
+            _ => {
+                let orig = store.read_file(&state.path, id).await?;
+                let mut truncated = Truncate {
+                    inner: orig,
+                    remaining: size,
+                };
+                store.write_file(&state.path, &mut truncated).await?
+            }
+        };
+        drop(mutable);
+        update_trees_locked(&inodes, store, inode as usize).await?;
+        Ok(())
+    }
+}
+
+pin_project! {
+    struct Truncate<T> {
+        #[pin]
+        inner: T,
+        remaining: u64,
+    }
+}
+
+impl<T: AsyncRead> AsyncRead for Truncate<T> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.project();
+        let max = Ord::max(
+            buf.len(),
+            usize::try_from(*this.remaining).unwrap_or(usize::MAX),
+        );
+        if max == 0 {
+            return Poll::Ready(Ok(0));
+        }
+        let n = ready!(this.inner.poll_read(cx, &mut buf[..max]))?;
+        if n > 0 {
+            *this.remaining -= n as u64;
+            return Poll::Ready(Ok(n));
+        }
+        // Zero-pad
+        buf[..max].fill(0);
+        *this.remaining -= max as u64;
+        Poll::Ready(Ok(max))
     }
 }
 
