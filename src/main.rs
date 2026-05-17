@@ -455,6 +455,40 @@ impl fractal_fuse::Filesystem for Fs {
         })
     }
 
+    async fn mkdir(
+        &self,
+        _req: Request,
+        parent: Inode,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+    ) -> FsResult<ReplyEntry> {
+        let name = translate_name(name)?;
+        let repo = self.shared.repo().await;
+        let value = TreeValue::Tree(repo.store().empty_tree_id().clone());
+        let attr = value_stat(&value);
+        let ino = self
+            .shared
+            .inodes
+            .insert(repo.store(), parent, name, value)
+            .await
+            .map_err(|e| {
+                error!("updating directory metadata leading to file: {e:#}");
+                EIO
+            })?;
+
+        self.shared.write_commit().await.map_err(|e| {
+            error!("committing new directory: {e:#}");
+            EIO
+        })?;
+
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr: FileAttr { ino, ..attr },
+            generation: 0,
+        })
+    }
+
     async fn statfs(&self, _req: Request, _inode: u64) -> FsResult<ReplyStatfs> {
         Ok(ReplyStatfs {
             blocks: 0,
