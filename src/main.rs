@@ -13,12 +13,12 @@ use clap::Parser;
 use fractal_fuse::abi::FUSE_ROOT_ID;
 use fractal_fuse::{
     DirectoryEntry, DirectoryEntryPlus, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, FileAttr, FileType,
-    FsResult, Inode, MountOptions, ReplyAttr, ReplyEntry, ReplyOpen, ReplyReadlink, ReplyStatfs,
-    Request, Timestamp,
+    FsResult, Inode, MountOptions, ReplyAttr, ReplyCreate, ReplyEntry, ReplyOpen, ReplyReadlink,
+    ReplyStatfs, Request, Timestamp,
 };
 use futures_util::AsyncRead;
 use futures_util::io::AsyncReadExt;
-use jj_lib::backend::{BackendResult, Tree, TreeId, TreeValue};
+use jj_lib::backend::{BackendResult, CopyId, Tree, TreeId, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::ref_name::WorkspaceName;
@@ -181,6 +181,49 @@ impl fractal_fuse::Filesystem for Fs {
             fh: 0,
             flags: 0,
             backing_id: 0,
+        })
+    }
+
+    async fn create(
+        &self,
+        _req: Request,
+        parent: Inode,
+        name: &OsStr,
+        mode: u32,
+        _flags: u32,
+    ) -> FsResult<ReplyCreate> {
+        let name = translate_name(name)?;
+        let repo = self.shared.repo().await;
+        let path = self.shared.inodes.get_path(parent).await.join(name);
+        let id = repo
+            .store()
+            .write_file(&path, &mut &[][..])
+            .await
+            .map_err(|e| {
+                error!("creating empty file at {path:?}: {e:#}");
+                EIO
+            })?;
+        let value = TreeValue::File {
+            id,
+            executable: mode & 0o100 != 0,
+            copy_id: CopyId::placeholder(), // ???
+        };
+        let attr = value_stat(&value);
+        let ino = self
+            .shared
+            .inodes
+            .insert(repo.store(), parent, name, value)
+            .await
+            .map_err(|e| {
+                error!("updating directory metadata leading file: {e:#}");
+                EIO
+            })?;
+        Ok(ReplyCreate {
+            ttl: TTL,
+            attr: FileAttr { ino, ..attr },
+            generation: 0,
+            fh: 0,
+            flags: 0,
         })
     }
 
