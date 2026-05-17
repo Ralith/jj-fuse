@@ -2,6 +2,11 @@
 name = "jj-fuse"
 version = "0.1.0"
 edition = "2024"
+description = "A Linux virtual filesystem for manipulating commits in a jj repository"
+authors = ["Benjamin Saunders <ben.e.saunders@gmail.com>"]
+license = "MIT OR Apache-2.0 OR Zlib"
+repository = "https://github.com/Ralith/jj-fuse"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.102"
