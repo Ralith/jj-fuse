@@ -298,6 +298,42 @@ impl fractal_fuse::Filesystem for Fs {
         Ok(data.len())
     }
 
+    async fn flush(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _lock_owner: u64,
+    ) -> FsResult<()> {
+        self.shared.write_commit().await.map_err(|e| {
+            error!("committing for flush: {e:#}");
+            EIO
+        })?;
+        Ok(())
+    }
+
+    async fn fsync(&self, _req: Request, _inode: Inode, _fh: u64, _datasync: bool) -> FsResult<()> {
+        self.shared.write_commit().await.map_err(|e| {
+            error!("committing for fsync: {e:#}");
+            EIO
+        })?;
+        Ok(())
+    }
+
+    async fn fsyncdir(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _datasync: bool,
+    ) -> FsResult<()> {
+        self.shared.write_commit().await.map_err(|e| {
+            error!("committing for fsyncdir: {e:#}");
+            EIO
+        })?;
+        Ok(())
+    }
+
     async fn symlink(
         &self,
         _req: Request,
