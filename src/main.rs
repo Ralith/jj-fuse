@@ -58,10 +58,14 @@ fn run() -> anyhow::Result<()> {
         .context("opening repository")?;
     let shared = fs.shared.clone();
     trace!("mounting");
-    let result = fractal_fuse::Session::new(args.mountpoint, MountOptions::new().fs_name("jj"))
+    let session = fractal_fuse::Session::new(args.mountpoint, MountOptions::new().fs_name("jj"))
         .context("mounting")?
-        .queue_depth(128)
-        .run(fs);
+        .queue_depth(128);
+    let notifier = session.notifier();
+    ctrlc::set_handler(move || notifier.shutdown()).unwrap();
+    trace!("running");
+    let result = session.run(fs);
+    trace!("shutting down");
     rt.block_on(shared.write_commit())
         .context("committing final state")?;
     if let Err(e) = result {
