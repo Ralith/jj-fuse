@@ -18,7 +18,9 @@ use fractal_fuse::{
 };
 use futures_util::AsyncRead;
 use futures_util::io::AsyncReadExt;
-use jj_lib::backend::{BackendResult, CopyId, Tree, TreeValue};
+use jj_lib::backend::{
+    BackendResult, CommitId, CopyId, FileId, SymlinkId, Tree, TreeId, TreeValue,
+};
 use jj_lib::commit::Commit;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::ref_name::WorkspaceName;
@@ -246,11 +248,11 @@ impl fractal_fuse::Filesystem for Fs {
         let inodes = self.shared.inodes.read().await;
         let state = inodes.get(inode as usize).unwrap();
         let mut mutable_state = state.mutable_state.write().await;
-        let TreeValue::File {
+        let InodeData::File(FileInode {
             id,
             executable,
             copy_id,
-        } = &mutable_state.value
+        }) = &*mutable_state
         else {
             return Err(EISDIR);
         };
@@ -284,11 +286,11 @@ impl fractal_fuse::Filesystem for Fs {
                 EIO
             })?;
         trace!("created edited file {updated_file}");
-        mutable_state.value = TreeValue::File {
+        *mutable_state = InodeData::File(FileInode {
             id: updated_file,
             executable,
             copy_id,
-        };
+        });
         drop(mutable_state);
 
         self.shared.update_trees(inode).await.map_err(|e| {
@@ -530,7 +532,7 @@ impl fractal_fuse::Filesystem for Fs {
         {
             let new_parent_state = inodes.get_mut(new_parent as usize).unwrap();
             let new_mutable = new_parent_state.mutable_state.get_mut();
-            let TreeValue::Tree(id) = &new_mutable.value else {
+            let Some(TreeInode { id, .. }) = new_mutable.as_tree() else {
                 unreachable!()
             };
 
@@ -558,7 +560,7 @@ impl fractal_fuse::Filesystem for Fs {
         let inode = {
             let parent_state = inodes.get_mut(parent as usize).unwrap();
             let mutable = parent_state.mutable_state.get_mut();
-            let TreeValue::Tree(id) = &mutable.value else {
+            let Some(TreeInode { id, children }) = mutable.as_tree_mut() else {
                 unreachable!()
             };
             orig_src_tree = self
@@ -574,21 +576,21 @@ impl fractal_fuse::Filesystem for Fs {
                     EIO
                 })?;
 
-            mutable.children.as_mut().unwrap().remove(name).unwrap()
+            children.remove(name).unwrap()
         };
 
         // Write target side
         let prev_inode;
         {
             let new_parent_state = inodes.get_mut(new_parent as usize).unwrap();
-            let new_mutable = new_parent_state.mutable_state.get_mut();
+            let new_mutable = new_parent_state
+                .mutable_state
+                .get_mut()
+                .as_tree_mut()
+                .unwrap();
 
             // Write inode
-            prev_inode = new_mutable
-                .children
-                .as_mut()
-                .unwrap()
-                .insert(new_name.to_owned(), inode);
+            prev_inode = new_mutable.children.insert(new_name.to_owned(), inode);
 
             // Write tree entry
             let updated_dst_tree = tree_insert(
@@ -605,7 +607,7 @@ impl fractal_fuse::Filesystem for Fs {
                     error!("updating tree {:?} for rename: {e:#}", orig_dst_tree.dir());
                     EIO
                 })?;
-            new_mutable.value = TreeValue::Tree(updated_dst_tree.id().clone());
+            new_mutable.id = updated_dst_tree.id().clone();
             // Don't clobber the new file if this is a rename within the same dir
             if parent == new_parent {
                 orig_src_tree = updated_dst_tree;
@@ -615,15 +617,11 @@ impl fractal_fuse::Filesystem for Fs {
         // Write source side
         {
             let parent_state = inodes.get_mut(parent as usize).unwrap();
-            let mutable = parent_state.mutable_state.get_mut();
+            let mutable = parent_state.mutable_state.get_mut().as_tree_mut().unwrap();
             if flags & RENAME_EXCHANGE != 0
                 && let Some(prev_inode) = prev_inode
             {
-                mutable
-                    .children
-                    .as_mut()
-                    .unwrap()
-                    .insert(name.to_owned(), prev_inode);
+                mutable.children.insert(name.to_owned(), prev_inode);
             }
             let updated_src_tree = match (flags & RENAME_EXCHANGE != 0, prev_value) {
                 (true, Some(prev_value)) => tree_insert(&orig_src_tree, name, prev_value.clone()),
@@ -638,7 +636,7 @@ impl fractal_fuse::Filesystem for Fs {
                     error!("updating tree {:?} for rename: {e:#}", orig_src_tree.dir());
                     EIO
                 })?;
-            mutable.value = TreeValue::Tree(updated_src_tree.id().clone());
+            mutable.id = updated_src_tree.id().clone();
         }
 
         update_trees_locked(&inodes, &self.shared.store, parent as usize)
@@ -756,8 +754,7 @@ impl Shared {
             .mutable_state
             .read()
             .await
-            .value
-            .clone()
+            .to_tree_value()
     }
 
     async fn get_path(&self, inode: Inode) -> RepoPathBuf {
@@ -775,7 +772,7 @@ impl Shared {
         let state = inodes.get(inode as usize).unwrap();
         (
             state.path.clone(),
-            state.mutable_state.read().await.value.clone(),
+            state.mutable_state.read().await.to_tree_value(),
         )
     }
 
@@ -840,7 +837,7 @@ impl Shared {
         {
             let inodes = self.inodes.read().await;
             let state = inodes.get(inode as usize).unwrap();
-            let value = state.mutable_state.read().await.value.clone();
+            let value = state.mutable_state.read().await.to_tree_value();
             let TreeValue::Tree(id) = &value else {
                 return Err(ENOTDIR);
             };
@@ -859,7 +856,7 @@ impl Shared {
                         .mutable_state
                         .read()
                         .await
-                        .value,
+                        .to_tree_value(),
                     "..",
                     2,
                 ));
@@ -901,8 +898,8 @@ impl Shared {
             .mutable_state
             .read()
             .await
+            .as_tree()?
             .children
-            .as_ref()?
             .get(name)?;
         inodes
             .get(i)
@@ -925,17 +922,17 @@ impl Shared {
 
         let mut inodes = self.inodes.write().await;
         {
-            let Some(children) = &inodes
+            let Some(tree) = &inodes
                 .get_mut(parent_ino as usize)
                 .unwrap()
                 .mutable_state
                 .get_mut()
-                .children
+                .as_tree()
             else {
                 return Err(ENOTDIR);
             };
             // Guard against races with another identical call to this method
-            if let Some(i) = children.get(name).copied() {
+            if let Some(i) = tree.children.get(name).copied() {
                 inodes
                     .get(i)
                     .unwrap()
@@ -947,7 +944,12 @@ impl Shared {
 
         // Create a child inode
         let parent = inodes.get_mut(parent_ino as usize).unwrap();
-        let TreeValue::Tree(parent_tree_id) = parent.mutable_state.get_mut().value.clone() else {
+        let Some(parent_tree_id) = parent
+            .mutable_state
+            .get_mut()
+            .as_tree()
+            .map(|x| x.id.clone())
+        else {
             unreachable!()
         };
 
@@ -973,9 +975,9 @@ impl Shared {
             .unwrap()
             .mutable_state
             .get_mut()
-            .children
-            .as_mut()
+            .as_tree_mut()
             .unwrap()
+            .children
             .insert(name.to_owned(), n);
         Ok(n as u64)
     }
@@ -1004,9 +1006,9 @@ impl Shared {
                 .unwrap()
                 .mutable_state
                 .get_mut()
-                .children
-                .as_mut()
+                .as_tree_mut()
                 .unwrap()
+                .children
                 .remove(&*parent.child_name)
                 .unwrap();
             debug_assert_eq!(parent_child, i);
@@ -1032,9 +1034,9 @@ impl Shared {
             .unwrap()
             .mutable_state
             .get_mut()
-            .children
-            .as_mut()
+            .as_tree_mut()
             .unwrap()
+            .children
             .insert(name.to_owned(), inode);
 
         update_trees_locked(&inodes, &self.store, inode).await?;
@@ -1047,7 +1049,7 @@ impl Shared {
         let state = inodes.get(parent as usize).unwrap();
         // Hold a write lock for the duration so racing metadata ops don't lose data
         let mut mutable = state.mutable_state.write().await;
-        let TreeValue::Tree(id) = &mut mutable.value else {
+        let Some(TreeInode { id, .. }) = mutable.as_tree_mut() else {
             unreachable!()
         };
         let tree = self.store.get_tree(state.path.clone(), id).await?;
@@ -1073,7 +1075,7 @@ impl Shared {
         let inodes = self.inodes.read().await;
         let state = inodes.get(inode as usize).unwrap();
         let mut mutable = state.mutable_state.write().await;
-        let TreeValue::File { id, .. } = &mut mutable.value else {
+        let Some(FileInode { id, .. }) = mutable.as_file_mut() else {
             unreachable!()
         };
         *id = match size {
@@ -1145,19 +1147,19 @@ async fn update_trees_locked(
         // `inode` is the root; there's nowhere to propagate
         return Ok(());
     };
-    let mut value = state.mutable_state.read().await.value.clone();
+    let mut value = state.mutable_state.read().await.to_tree_value();
 
     loop {
         let parent = inodes.get(parent_info.parent).unwrap();
         let mut parent_state = parent.mutable_state.write().await;
-        let TreeValue::Tree(id) = &mut parent_state.value else {
-            unreachable!()
-        };
-        let tree = store.get_tree(parent.path.clone(), id).await?;
+        let parent_state = parent_state.as_tree_mut().unwrap();
+        let tree = store
+            .get_tree(parent.path.clone(), &parent_state.id)
+            .await?;
         let new_tree = tree_insert(&tree, &parent_info.child_name, value);
         let new_tree_id = store.write_tree(&parent.path, new_tree).await?.id().clone();
-        value = TreeValue::Tree(new_tree_id);
-        parent_state.value = value.clone();
+        value = TreeValue::Tree(new_tree_id.clone());
+        parent_state.id = new_tree_id;
 
         if let Some(next) = &parent.parent {
             parent_info = next.clone();
@@ -1196,31 +1198,110 @@ fn tree_remove(tree: &jj_lib::tree::Tree, name: &RepoPathComponent) -> Tree {
 
 struct InodeState {
     path: RepoPathBuf,
-    mutable_state: RwLock<InodeMutableState>,
+    mutable_state: RwLock<InodeData>,
     references: AtomicU64,
     parent: Option<InodeParent>,
 }
 
 impl InodeState {
     fn new(path: RepoPathBuf, value: TreeValue) -> Self {
-        let children = match value {
-            TreeValue::Tree(_) => Some(FxHashMap::default()),
-            _ => None,
-        };
         Self {
             path,
-            mutable_state: RwLock::new(InodeMutableState { value, children }),
+            mutable_state: RwLock::new(InodeData::from(value)),
             references: AtomicU64::new(1),
             parent: None,
         }
     }
 }
 
-struct InodeMutableState {
-    /// May diverge from what's recorded in the parent until flushed
-    value: TreeValue,
-    /// Populated iff value is Tree
-    children: Option<FxHashMap<RepoPathComponentBuf, usize>>,
+/// Data that an inode may represent
+///
+/// Corresponds to jj's [`TreeValue`], but with some extra state
+#[derive(Debug, Clone)]
+enum InodeData {
+    Tree(TreeInode),
+    File(FileInode),
+    Symlink(SymlinkId),
+    GitSubmodule(CommitId),
+}
+
+impl InodeData {
+    fn as_tree(&self) -> Option<&TreeInode> {
+        match self {
+            Self::Tree(x) => Some(x),
+            _ => None,
+        }
+    }
+
+    fn as_tree_mut(&mut self) -> Option<&mut TreeInode> {
+        match self {
+            Self::Tree(x) => Some(x),
+            _ => None,
+        }
+    }
+
+    #[expect(dead_code)]
+    fn as_file(&self) -> Option<&FileInode> {
+        match self {
+            Self::File(x) => Some(x),
+            _ => None,
+        }
+    }
+
+    fn as_file_mut(&mut self) -> Option<&mut FileInode> {
+        match self {
+            Self::File(x) => Some(x),
+            _ => None,
+        }
+    }
+
+    fn to_tree_value(&self) -> TreeValue {
+        match self {
+            InodeData::Tree(x) => TreeValue::Tree(x.id.clone()),
+            InodeData::File(x) => TreeValue::File {
+                id: x.id.clone(),
+                executable: x.executable,
+                copy_id: x.copy_id.clone(),
+            },
+            InodeData::Symlink(x) => TreeValue::Symlink(x.clone()),
+            InodeData::GitSubmodule(x) => TreeValue::GitSubmodule(x.clone()),
+        }
+    }
+}
+
+impl From<TreeValue> for InodeData {
+    fn from(value: TreeValue) -> Self {
+        match value {
+            TreeValue::File {
+                id,
+                executable,
+                copy_id,
+            } => InodeData::File(FileInode {
+                id,
+                executable,
+                copy_id,
+            }),
+            TreeValue::Symlink(symlink_id) => InodeData::Symlink(symlink_id),
+            TreeValue::Tree(tree_id) => InodeData::Tree(TreeInode {
+                id: tree_id,
+                children: FxHashMap::default(),
+            }),
+            TreeValue::GitSubmodule(x) => InodeData::GitSubmodule(x),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TreeInode {
+    id: TreeId,
+    children: FxHashMap<RepoPathComponentBuf, usize>,
+}
+
+#[derive(Debug, Clone)]
+struct FileInode {
+    id: FileId,
+    executable: bool,
+    copy_id: CopyId,
 }
 
 fn value_ty(value: &TreeValue) -> FileType {
