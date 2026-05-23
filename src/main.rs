@@ -412,15 +412,17 @@ impl fractal_fuse::Filesystem for Fs {
         _req: Request,
         inode: Inode,
         _fh: u64,
-        offset: u64,
-        size: u32,
+        start_offset: u64,
+        _size: u32,
     ) -> FsResult<Vec<DirectoryEntry>> {
         self.shared
-            .readdir(inode, offset, size, |value, name, offset| DirectoryEntry {
-                ino: 0,
-                offset,
-                kind: value_ty(value),
-                name: name.as_bytes().to_vec(),
+            .readdir(inode, |value, name, offset| {
+                (offset > start_offset).then(|| DirectoryEntry {
+                    ino: 0,
+                    offset,
+                    kind: value_ty(value),
+                    name: name.as_bytes().to_vec(),
+                })
             })
             .await
     }
@@ -430,12 +432,12 @@ impl fractal_fuse::Filesystem for Fs {
         _req: Request,
         inode: u64,
         _fh: u64,
-        offset: u64,
-        size: u32,
+        start_offset: u64,
+        _size: u32,
     ) -> FsResult<Vec<DirectoryEntryPlus>> {
         self.shared
-            .readdir(inode, offset, size, |value, name, offset| {
-                DirectoryEntryPlus {
+            .readdir(inode, |value, name, offset| {
+                (offset > start_offset).then(|| DirectoryEntryPlus {
                     ino: 0,
                     offset,
                     kind: value_ty(value),
@@ -443,7 +445,7 @@ impl fractal_fuse::Filesystem for Fs {
                     entry_ttl: TTL,
                     attr: value_stat(value),
                     generation: 0,
-                }
+                })
             })
             .await
     }
@@ -832,15 +834,9 @@ impl Shared {
         })
     }
 
-    async fn readdir<T, F>(
-        &self,
-        inode: Inode,
-        offset: u64,
-        size: u32,
-        mut f: F,
-    ) -> FsResult<Vec<T>>
+    async fn readdir<T, F>(&self, inode: Inode, mut f: F) -> FsResult<Vec<T>>
     where
-        F: FnMut(&TreeValue, &str, u64) -> T,
+        F: FnMut(&TreeValue, &str, u64) -> Option<T>,
     {
         let mut entries = Vec::new();
         let dir_path;
@@ -854,13 +850,9 @@ impl Shared {
             };
             dir_path = state.path.clone();
             tree_id = id.clone();
-            if offset < 1 {
-                entries.push(f(&value, ".", 1));
-            }
-            if offset < 2
-                && let Some(p) = &state.parent
-            {
-                entries.push(f(
+            entries.extend(f(&value, ".", 1));
+            if let Some(p) = &state.parent {
+                entries.extend(f(
                     &inodes
                         .get(p.parent)
                         .unwrap()
@@ -885,10 +877,7 @@ impl Shared {
         if let Some(hint) = iter.size_hint().1 {
             entries.reserve_exact(hint);
         }
-        let skip = offset.saturating_sub(entries.len() as u64) as usize;
-        let base = offset + entries.len() as u64;
-        let limit = size as usize - skip;
-        for (i, entry) in iter.skip(skip).take(limit).enumerate() {
+        for entry in iter {
             let name = match entry.name().to_fs_name() {
                 Ok(name) => name,
                 Err(e) => {
@@ -896,8 +885,10 @@ impl Shared {
                     continue;
                 }
             };
-            entries.push(f(entry.value(), name, i as u64 + base + 1));
+            let n = entries.len();
+            entries.extend(f(entry.value(), name, n as u64 + 1));
         }
+
         Ok(entries)
     }
 
