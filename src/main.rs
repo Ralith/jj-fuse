@@ -1,7 +1,8 @@
+mod dir;
+mod dir_fd;
+
 use std::ffi::OsStr;
-use std::fs::File;
 use std::io;
-use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,6 +28,8 @@ use jj_lib::commit::Commit;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::{ReadonlyRepo, Repo, StoreFactories};
+use jj_lib::repo_path::InvalidRepoPathComponentError;
+use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::{RepoPathBuf, RepoPathComponent, RepoPathComponentBuf};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
@@ -36,6 +39,9 @@ use rustc_hash::FxHashMap;
 use slab::Slab;
 use tokio::sync::RwLock;
 use tracing::{error, trace};
+
+use crate::dir::Dir;
+use crate::dir_fd::DirFd;
 
 #[derive(Parser)]
 #[command(version)]
@@ -58,7 +64,7 @@ fn run() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new().context("initializing tokio")?;
     trace!("opening repository");
     let fs = rt
-        .block_on(Fs::new(&args.repository, &args.mountpoint))
+        .block_on(Fs::new(&args.repository, args.mountpoint.clone()))
         .context("opening repository")?;
     let shared = fs.shared.clone();
     trace!("mounting");
@@ -88,7 +94,7 @@ struct Fs {
 }
 
 impl Fs {
-    async fn new(path: &Path, underlying_dir: &Path) -> anyhow::Result<Self> {
+    async fn new(path: &Path, underlying_dir: PathBuf) -> anyhow::Result<Self> {
         let path = path.join(".jj/repo");
         let mut cfg = jj_lib::config::StackedConfig::with_defaults();
         cfg.load_dir(jj_lib::config::ConfigSource::Repo, &path)?;
@@ -109,10 +115,8 @@ impl Fs {
             .await
             .context("reading commit")?;
 
-        let underlying_dir = File::open(underlying_dir).context("opening underlying directory")?;
-
         Ok(Self {
-            shared: Arc::new(Shared::new(repo, commit, underlying_dir.into())?),
+            shared: Arc::new(Shared::new(repo, commit, underlying_dir)?),
         })
     }
 }
@@ -416,11 +420,11 @@ impl fractal_fuse::Filesystem for Fs {
         _size: u32,
     ) -> FsResult<Vec<DirectoryEntry>> {
         self.shared
-            .readdir(inode, |value, name, offset| {
+            .readdir(inode, |stat, name, offset| {
                 (offset > start_offset).then(|| DirectoryEntry {
                     ino: 0,
                     offset,
-                    kind: value_ty(value),
+                    kind: stat.ty(),
                     name: name.as_bytes().to_vec(),
                 })
             })
@@ -436,14 +440,20 @@ impl fractal_fuse::Filesystem for Fs {
         _size: u32,
     ) -> FsResult<Vec<DirectoryEntryPlus>> {
         self.shared
-            .readdir(inode, |value, name, offset| {
-                (offset > start_offset).then(|| DirectoryEntryPlus {
+            .readdir(inode, |stat, name, offset| {
+                if offset <= start_offset {
+                    return None;
+                }
+                Some(DirectoryEntryPlus {
                     ino: 0,
                     offset,
-                    kind: value_ty(value),
+                    kind: stat.ty(),
                     name: name.as_bytes().to_vec(),
                     entry_ttl: TTL,
-                    attr: value_stat(value),
+                    attr: stat
+                        .stat(name)
+                        .inspect_err(|e| error!("statting underlying file {name}: {e}"))
+                        .ok()?,
                     generation: 0,
                 })
             })
@@ -703,19 +713,21 @@ struct Shared {
     store: Arc<Store>,
     repo_state: RwLock<RepoState>,
     inodes: RwLock<Slab<InodeState>>,
-    underlying_dir: OwnedFd,
+    underlying_dir: DirFd,
 }
 
 impl Shared {
     fn new(
         repo: Arc<ReadonlyRepo>,
         commit: Commit,
-        underlying_dir: OwnedFd,
+        underlying_dir_path: PathBuf,
     ) -> anyhow::Result<Self> {
         let Some(root_id) = commit.tree_ids().as_resolved().cloned() else {
             bail!("conflicted trees are not implemented");
         };
         let root_inode = InodeState::new(RepoPathBuf::root(), TreeValue::Tree(root_id.clone()));
+        let underlying_dir =
+            DirFd::open(&underlying_dir_path).context("opening underlying directory")?;
         Ok(Self {
             store: repo.store().clone(),
             repo_state: RwLock::new(RepoState { repo, commit }),
@@ -836,7 +848,7 @@ impl Shared {
 
     async fn readdir<T, F>(&self, inode: Inode, mut f: F) -> FsResult<Vec<T>>
     where
-        F: FnMut(&TreeValue, &str, u64) -> Option<T>,
+        F: FnMut(Stattable<'_>, &str, u64) -> Option<T>,
     {
         let mut entries = Vec::new();
         let dir_path;
@@ -850,16 +862,18 @@ impl Shared {
             };
             dir_path = state.path.clone();
             tree_id = id.clone();
-            entries.extend(f(&value, ".", 1));
+            entries.extend(f(Stattable::from(&value), ".", 1));
             if let Some(p) = &state.parent {
                 entries.extend(f(
-                    &inodes
-                        .get(p.parent)
-                        .unwrap()
-                        .mutable_state
-                        .read()
-                        .await
-                        .to_tree_value(),
+                    Stattable::from(
+                        &inodes
+                            .get(p.parent)
+                            .unwrap()
+                            .mutable_state
+                            .read()
+                            .await
+                            .to_tree_value(),
+                    ),
                     "..",
                     2,
                 ));
@@ -886,7 +900,55 @@ impl Shared {
                 }
             };
             let n = entries.len();
-            entries.extend(f(entry.value(), name, n as u64 + 1));
+            entries.extend(f(Stattable::from(entry.value()), name, n as u64 + 1));
+        }
+
+        let dir_path = to_relative_fs_path(&dir_path).map_err(|e| {
+            error!("illegal path {dir_path:?}: {e:#}");
+            EIO
+        })?;
+        match self.underlying_dir.open_child(&dir_path) {
+            Ok(fd) => {
+                let iter = Dir::new(fd).map_err(|e| {
+                    error!("accessing underlying directory for {dir_path:?}: {e}");
+                    EIO
+                })?;
+                for entry in iter {
+                    let entry = match entry {
+                        Ok(x) => x,
+                        Err(e) => {
+                            error!("reading underlying directory for {dir_path:?}: {e}");
+                            break;
+                        }
+                    };
+                    let name = match str::from_utf8(&entry.name) {
+                        Ok(x) => x,
+                        Err(e) => {
+                            error!(
+                                "hiding unrepresentable name {:?}: {:#}",
+                                entry.name.escape_ascii(),
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    let n = entries.len();
+                    entries.extend(f(
+                        Stattable::Underlying {
+                            underlying_dir: &self.underlying_dir,
+                            dir_path: &dir_path,
+                            ty: entry.ty,
+                        },
+                        name,
+                        n as u64 + 1,
+                    ));
+                }
+            }
+            // No underlying files
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                error!("accessing underlying directory for {dir_path:?}: {e}");
+            }
         }
 
         Ok(entries)
@@ -1095,6 +1157,44 @@ impl Shared {
         drop(mutable);
         update_trees_locked(&inodes, &self.store, inode as usize).await?;
         Ok(())
+    }
+}
+
+enum Stattable<'a> {
+    Tracked(&'a TreeValue),
+    Underlying {
+        underlying_dir: &'a DirFd,
+        dir_path: &'a Path,
+        ty: FileType,
+    },
+}
+
+impl Stattable<'_> {
+    fn ty(&self) -> FileType {
+        match self {
+            Stattable::Tracked(value) => value_ty(value),
+            Stattable::Underlying { ty, .. } => *ty,
+        }
+    }
+
+    fn stat(&self, name: &str) -> io::Result<FileAttr> {
+        match *self {
+            Stattable::Tracked(value) => Ok(value_stat(value)),
+            Stattable::Underlying {
+                underlying_dir,
+                dir_path,
+                ..
+            } => {
+                let path = dir_path.join(name);
+                Ok(underlying_dir.stat_child(&path)?)
+            }
+        }
+    }
+}
+
+impl<'a> From<&'a TreeValue> for Stattable<'a> {
+    fn from(value: &'a TreeValue) -> Self {
+        Self::Tracked(value)
     }
 }
 
@@ -1393,6 +1493,17 @@ fn translate_name(name: &OsStr) -> FsResult<&RepoPathComponent> {
         error!("illegal name: {name:?}: {e:#}");
         EINVAL
     })?)
+}
+
+fn to_relative_fs_path(path: &RepoPath) -> Result<PathBuf, InvalidRepoPathComponentError> {
+    let mut buf = PathBuf::with_capacity(path.as_internal_file_string().len());
+    for component in path.components() {
+        buf.push(component.to_fs_name()?);
+    }
+    if buf.as_os_str().is_empty() {
+        buf.push(".");
+    }
+    Ok(buf)
 }
 
 const TTL: Duration = Duration::from_secs(60);
