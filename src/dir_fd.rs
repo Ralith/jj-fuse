@@ -6,7 +6,7 @@ use std::{
 };
 
 use fractal_fuse::{FileAttr, Timestamp};
-use libc::{O_DIRECTORY, O_PATH};
+use libc::{O_DIRECTORY, O_PATH, PATH_MAX};
 
 pub struct DirFd(OwnedFd);
 
@@ -69,6 +69,24 @@ impl DirFd {
                 rdev: stat.st_rdev as u32,
                 blksize: stat.st_blksize as u32,
             })
+        }
+    }
+
+    pub fn readlink_child(&self, child: &Path) -> io::Result<Vec<u8>> {
+        let path = CString::new(child.as_os_str().as_encoded_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let mut buf = [0u8; PATH_MAX as usize];
+        unsafe {
+            let r = libc::readlinkat(
+                self.0.as_raw_fd(),
+                path.as_ptr().cast(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            );
+            if r == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(buf[0..r as usize].to_vec())
         }
     }
 }

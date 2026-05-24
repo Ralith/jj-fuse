@@ -17,7 +17,7 @@ use fractal_fuse::abi::FUSE_ROOT_ID;
 use fractal_fuse::{
     DirectoryEntry, DirectoryEntryPlus, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, FileAttr,
     FileType, FsResult, Inode, MountOptions, ReplyAttr, ReplyCreate, ReplyEntry, ReplyOpen,
-    ReplyReadlink, ReplyStatfs, Request, Timestamp,
+    ReplyReadlink, ReplyStatfs, Request,
 };
 use futures_util::AsyncRead;
 use futures_util::io::AsyncReadExt;
@@ -203,14 +203,10 @@ impl fractal_fuse::Filesystem for Fs {
             executable: mode & 0o100 != 0,
             copy_id: CopyId::placeholder(), // ???
         };
-        let attr = value_stat(&value);
-        let ino = self.shared.insert(parent, name, value).await.map_err(|e| {
-            error!("updating directory metadata leading file: {e:#}");
-            EIO
-        })?;
+        let attr = self.shared.insert(parent, name, value).await?;
         Ok(ReplyCreate {
             ttl: TTL,
-            attr: FileAttr { ino, ..attr },
+            attr,
             generation: 0,
             fh: 0,
             flags: 0,
@@ -375,11 +371,7 @@ impl fractal_fuse::Filesystem for Fs {
                 EIO
             })?;
         let value = TreeValue::Symlink(id);
-        let attr = value_stat(&value);
-        let ino = self.shared.insert(parent, name, value).await.map_err(|e| {
-            error!("updating directory metadata leading to symlink {path:?}: {e:#}");
-            EIO
-        })?;
+        let attr = self.shared.insert(parent, name, value).await?;
 
         self.shared.write_commit().await.map_err(|e| {
             error!("committing new symlink: {e:#}");
@@ -388,27 +380,14 @@ impl fractal_fuse::Filesystem for Fs {
 
         Ok(ReplyEntry {
             ttl: TTL,
-            attr: FileAttr { ino, ..attr },
+            attr,
             generation: 0,
         })
     }
 
     async fn readlink(&self, _req: Request, inode: Inode) -> FsResult<ReplyReadlink> {
-        let (path, TreeValue::Symlink(id)) = self.shared.get_path_value(inode).await else {
-            return Err(EINVAL);
-        };
-        let target = self
-            .shared
-            .store
-            .read_symlink(&path, &id)
-            .await
-            .map_err(|e| {
-                error!("reading symlink {path:?}: {:#}", e);
-                EIO
-            })?;
-        Ok(ReplyReadlink {
-            data: target.into_bytes(),
-        })
+        let target = self.shared.readlink(inode).await?;
+        Ok(ReplyReadlink { data: target })
     }
 
     async fn readdir(
@@ -420,11 +399,11 @@ impl fractal_fuse::Filesystem for Fs {
         _size: u32,
     ) -> FsResult<Vec<DirectoryEntry>> {
         self.shared
-            .readdir(inode, |stat, name, offset| {
+            .readdir(inode, |kind, _, name, offset| {
                 (offset > start_offset).then(|| DirectoryEntry {
                     ino: 0,
                     offset,
-                    kind: stat.ty(),
+                    kind,
                     name: name.as_bytes().to_vec(),
                 })
             })
@@ -440,20 +419,17 @@ impl fractal_fuse::Filesystem for Fs {
         _size: u32,
     ) -> FsResult<Vec<DirectoryEntryPlus>> {
         self.shared
-            .readdir(inode, |stat, name, offset| {
+            .readdir(inode, |kind, attr, name, offset| {
                 if offset <= start_offset {
                     return None;
                 }
                 Some(DirectoryEntryPlus {
                     ino: 0,
                     offset,
-                    kind: stat.ty(),
+                    kind,
                     name: name.as_bytes().to_vec(),
                     entry_ttl: TTL,
-                    attr: stat
-                        .stat(name)
-                        .inspect_err(|e| error!("statting underlying file {name}: {e}"))
-                        .ok()?,
+                    attr,
                     generation: 0,
                 })
             })
@@ -478,11 +454,7 @@ impl fractal_fuse::Filesystem for Fs {
     ) -> FsResult<ReplyEntry> {
         let name = translate_name(name)?;
         let value = TreeValue::Tree(self.shared.store.empty_tree_id().clone());
-        let attr = value_stat(&value);
-        let ino = self.shared.insert(parent, name, value).await.map_err(|e| {
-            error!("updating directory metadata leading to directory: {e:#}");
-            EIO
-        })?;
+        let attr = self.shared.insert(parent, name, value).await?;
 
         self.shared.write_commit().await.map_err(|e| {
             error!("committing new directory: {e:#}");
@@ -491,7 +463,7 @@ impl fractal_fuse::Filesystem for Fs {
 
         Ok(ReplyEntry {
             ttl: TTL,
-            attr: FileAttr { ino, ..attr },
+            attr,
             generation: 0,
         })
     }
@@ -744,8 +716,8 @@ impl Shared {
     }
 
     async fn write_commit(&self) -> anyhow::Result<()> {
-        let TreeValue::Tree(id) = self.get(FUSE_ROOT_ID).await else {
-            unreachable!()
+        let Some(TreeValue::Tree(id)) = self.get(FUSE_ROOT_ID).await else {
+            return Ok(());
         };
         // Rewrite the commit with the current tree
         let mut state = self.repo_state.write().await;
@@ -770,7 +742,7 @@ impl Shared {
         Ok(())
     }
 
-    async fn get(&self, inode: Inode) -> TreeValue {
+    async fn get(&self, inode: Inode) -> Option<TreeValue> {
         self.inodes
             .read()
             .await
@@ -792,7 +764,7 @@ impl Shared {
             .clone()
     }
 
-    async fn get_path_value(&self, inode: Inode) -> (RepoPathBuf, TreeValue) {
+    async fn get_path_value(&self, inode: Inode) -> (RepoPathBuf, Option<TreeValue>) {
         let inodes = self.inodes.read().await;
         let state = inodes.get(inode as usize).unwrap();
         (
@@ -801,8 +773,38 @@ impl Shared {
         )
     }
 
+    async fn readlink(&self, inode: Inode) -> FsResult<Vec<u8>> {
+        let inodes = self.inodes.read().await;
+        let state = inodes.get(inode as usize).unwrap();
+        Ok(match &*state.mutable_state.read().await {
+            InodeData::Symlink(id) => {
+                let target = self
+                    .store
+                    .read_symlink(&state.path, id)
+                    .await
+                    .map_err(|e| {
+                        error!("reading symlink {:?}: {e:#}", state.path);
+                        EIO
+                    })?;
+                target.into_bytes()
+            }
+            InodeData::IgnoredFile => {
+                let path = to_relative_fs_path(&state.path).map_err(|e| {
+                    error!("illegal path {:?}: {e:#}", state.path);
+                    EIO
+                })?;
+                let target = self.underlying_dir.readlink_child(&path).map_err(|e| {
+                    error!("reading symlink {:?}: {e}", state.path);
+                    EIO
+                })?;
+                target
+            }
+            _ => return Err(EINVAL),
+        })
+    }
+
     async fn read(&self, inode: Inode, mut offset: u64, buf: &mut [u8]) -> FsResult<usize> {
-        let (path, TreeValue::File { id, .. }) = self.get_path_value(inode).await else {
+        let (path, Some(TreeValue::File { id, .. })) = self.get_path_value(inode).await else {
             return Err(EISDIR);
         };
         let mut file = self.store.read_file(&path, &id).await.map_err(|e| {
@@ -826,83 +828,102 @@ impl Shared {
     }
 
     async fn stat(&self, inode: Inode) -> FsResult<FileAttr> {
-        let (path, value) = self.get_path_value(inode).await;
-        let mut size = 0;
-        if let TreeValue::File { id, .. } = &value {
-            let meta = self
-                .store
-                .get_file_metadata(&path, &id)
-                .await
-                .map_err(|e| {
-                    error!("fetching metadata for {path:?}: {:#}", e);
-                    EIO
-                })?;
-            size = meta.size;
-        };
         Ok(FileAttr {
             ino: inode,
-            size,
-            ..value_stat(&value)
+            ..self
+                .inodes
+                .read()
+                .await
+                .get(inode as usize)
+                .unwrap()
+                .stat(&self.store, &self.underlying_dir)
+                .await?
         })
     }
 
     async fn readdir<T, F>(&self, inode: Inode, mut f: F) -> FsResult<Vec<T>>
     where
-        F: FnMut(Stattable<'_>, &str, u64) -> Option<T>,
+        F: FnMut(FileType, FileAttr, &str, u64) -> Option<T>,
     {
+        // Future work: We could skip stat to speed up regular `readdir`, maybe by replacing `F`
+        // with a custom trait. We could also skip visiting elements outside the readdir offset/size
+        // range, but it's unclear if this is worth the trouble.
         let mut entries = Vec::new();
         let dir_path;
         let tree_id;
         {
             let inodes = self.inodes.read().await;
             let state = inodes.get(inode as usize).unwrap();
-            let value = state.mutable_state.read().await.to_tree_value();
-            let TreeValue::Tree(id) = &value else {
-                return Err(ENOTDIR);
-            };
             dir_path = state.path.clone();
-            tree_id = id.clone();
-            entries.extend(f(Stattable::from(&value), ".", 1));
+            let attr = FileAttr {
+                ino: inode,
+                ..state
+                    .stat(&self.store, &self.underlying_dir)
+                    .await
+                    .map_err(|e| {
+                        error!("looking up metadata for {dir_path:?}: {e:#}");
+                        EIO
+                    })?
+            };
+            let value = &*state.mutable_state.read().await;
+            tree_id = match value {
+                InodeData::Tree(tree_inode) => Some(tree_inode.id.clone()),
+                InodeData::IgnoredTree(_) => None,
+                _ => return Err(ENOTDIR),
+            };
+            entries.extend(f(FileType::Directory, attr, ".", 1));
             if let Some(p) = &state.parent {
-                entries.extend(f(
-                    Stattable::from(
-                        &inodes
-                            .get(p.parent)
-                            .unwrap()
-                            .mutable_state
-                            .read()
-                            .await
-                            .to_tree_value(),
-                    ),
-                    "..",
-                    2,
-                ));
+                let parent_attr = FileAttr {
+                    ino: p.parent as u64,
+                    ..inodes
+                        .get(p.parent)
+                        .unwrap()
+                        .stat(&self.store, &self.underlying_dir)
+                        .await
+                        .map_err(|e| {
+                            error!("looking up metadata for {dir_path:?}: {e:#}");
+                            EIO
+                        })?
+                };
+                entries.extend(f(FileType::Directory, parent_attr, "..", 2));
             }
         }
-        let tree = self
-            .store
-            .get_tree(dir_path.clone(), &tree_id)
-            .await
-            .map_err(|e| {
-                error!("opening directory {dir_path:?}: {:#}", e);
-                EIO
-            })?;
-        let iter = tree.entries_non_recursive();
-        if let Some(hint) = iter.size_hint().1 {
-            entries.reserve_exact(hint);
-        }
-        for entry in iter {
-            let name = match entry.name().to_fs_name() {
-                Ok(name) => name,
-                Err(e) => {
-                    error!("hiding unrepresentable name {:?}: {:#}", entry.name(), e);
-                    continue;
-                }
-            };
-            let n = entries.len();
-            entries.extend(f(Stattable::from(entry.value()), name, n as u64 + 1));
+
+        // Add entries from repo
+        if let Some(tree_id) = tree_id {
+            let tree = self
+                .store
+                .get_tree(dir_path.clone(), &tree_id)
+                .await
+                .map_err(|e| {
+                    error!("opening directory {dir_path:?}: {:#}", e);
+                    EIO
+                })?;
+            let iter = tree.entries_non_recursive();
+            if let Some(hint) = iter.size_hint().1 {
+                entries.reserve_exact(hint);
+            }
+            for entry in iter {
+                let name = match entry.name().to_fs_name() {
+                    Ok(name) => name,
+                    Err(e) => {
+                        error!("hiding unrepresentable name {:?}: {:#}", entry.name(), e);
+                        continue;
+                    }
+                };
+                let n = entries.len();
+                let entry_path = dir_path.join(entry.name());
+                let attr = value_stat(&self.store, &entry_path, entry.value())
+                    .await
+                    .map_err(|e| {
+                        error!("looking up metadata for directory entry {entry_path:?}: {e:#}");
+                        EIO
+                    })?;
+                entries.extend(f(value_ty(entry.value()), attr, name, n as u64 + 1));
+            }
         }
 
+        // Add untracked entries
         let dir_path = to_relative_fs_path(&dir_path).map_err(|e| {
             error!("illegal path {dir_path:?}: {e:#}");
             EIO
@@ -933,15 +954,12 @@ impl Shared {
                         }
                     };
                     let n = entries.len();
-                    entries.extend(f(
-                        Stattable::Underlying {
-                            underlying_dir: &self.underlying_dir,
-                            dir_path: &dir_path,
-                            ty: entry.ty,
-                        },
-                        name,
-                        n as u64 + 1,
-                    ));
+                    let path = dir_path.join(name);
+                    let attr = self.underlying_dir.stat_child(&path).map_err(|e| {
+                        error!("statting {:?}: {e}", path);
+                        EIO
+                    })?;
+                    entries.extend(f(entry.ty, attr, name, n as u64 + 1));
                 }
             }
             // No underlying files
@@ -1084,7 +1102,7 @@ impl Shared {
         parent: Inode,
         name: &RepoPathComponent,
         value: TreeValue,
-    ) -> BackendResult<Inode> {
+    ) -> FsResult<FileAttr> {
         let mut inodes = self.inodes.write().await;
         let full_path = inodes.get(parent as usize).unwrap().path.join(name);
         let mut state = InodeState::new(full_path, value.clone());
@@ -1093,19 +1111,27 @@ impl Shared {
             parent: parent as usize,
         });
         let inode = inodes.insert(state);
-        inodes
-            .get_mut(parent as usize)
-            .unwrap()
+        let inode_ref = inodes.get_mut(parent as usize).unwrap();
+        inode_ref
             .mutable_state
             .get_mut()
             .as_tree_mut()
             .unwrap()
             .children
             .insert(name.to_owned(), inode);
+        let attr = FileAttr {
+            ino: inode as u64,
+            ..inode_ref.stat(&self.store, &self.underlying_dir).await?
+        };
 
-        update_trees_locked(&inodes, &self.store, inode).await?;
+        update_trees_locked(&inodes, &self.store, inode)
+            .await
+            .map_err(|e| {
+                error!("updating trees for new inode: {e:#}");
+                EIO
+            })?;
 
-        Ok(inode as u64)
+        Ok(attr)
     }
 
     async fn remove(&self, parent: Inode, name: &RepoPathComponent) -> BackendResult<()> {
@@ -1160,44 +1186,6 @@ impl Shared {
     }
 }
 
-enum Stattable<'a> {
-    Tracked(&'a TreeValue),
-    Underlying {
-        underlying_dir: &'a DirFd,
-        dir_path: &'a Path,
-        ty: FileType,
-    },
-}
-
-impl Stattable<'_> {
-    fn ty(&self) -> FileType {
-        match self {
-            Stattable::Tracked(value) => value_ty(value),
-            Stattable::Underlying { ty, .. } => *ty,
-        }
-    }
-
-    fn stat(&self, name: &str) -> io::Result<FileAttr> {
-        match *self {
-            Stattable::Tracked(value) => Ok(value_stat(value)),
-            Stattable::Underlying {
-                underlying_dir,
-                dir_path,
-                ..
-            } => {
-                let path = dir_path.join(name);
-                Ok(underlying_dir.stat_child(&path)?)
-            }
-        }
-    }
-}
-
-impl<'a> From<&'a TreeValue> for Stattable<'a> {
-    fn from(value: &'a TreeValue) -> Self {
-        Self::Tracked(value)
-    }
-}
-
 /// Identifies the committed state a VFS view is based on
 struct RepoState {
     repo: Arc<ReadonlyRepo>,
@@ -1249,7 +1237,10 @@ async fn update_trees_locked(
         // `inode` is the root; there's nowhere to propagate
         return Ok(());
     };
-    let mut value = state.mutable_state.read().await.to_tree_value();
+    let Some(mut value) = state.mutable_state.read().await.to_tree_value() else {
+        // Untracked file; short-circuit
+        return Ok(());
+    };
 
     loop {
         let parent = inodes.get(parent_info.parent).unwrap();
@@ -1314,17 +1305,68 @@ impl InodeState {
             parent: None,
         }
     }
+
+    async fn stat(&self, store: &Arc<Store>, underlying_dir: &DirFd) -> FsResult<FileAttr> {
+        const EXECUTABLE_MODE: u32 = 0o111;
+        let mutable = self.mutable_state.read().await;
+        let default_attr = FileAttr {
+            mode: 0o664 | mutable.ty().map_or(0, FileType::to_mode),
+            nlink: 1,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            rdev: 0,
+            blksize: 512,
+            ..Default::default()
+        };
+        Ok(match &*mutable {
+            InodeData::File(file) => {
+                let meta = store
+                    .get_file_metadata(&self.path, &file.id)
+                    .await
+                    .map_err(|e| {
+                        error!("fetching metadata for {:?}: {e:#}", self.path);
+                        EIO
+                    })?;
+                let mut mode = 0;
+                if file.executable {
+                    mode |= EXECUTABLE_MODE;
+                }
+                FileAttr {
+                    mode: mode | default_attr.mode,
+                    size: meta.size,
+                    ..default_attr
+                }
+            }
+            InodeData::Tree(_) => FileAttr {
+                mode: EXECUTABLE_MODE | default_attr.mode,
+                ..default_attr
+            },
+            InodeData::IgnoredFile | InodeData::IgnoredTree(_) => {
+                let path = to_relative_fs_path(&self.path).map_err(|e| {
+                    error!("illegal path {:?}: {e:#}", self.path);
+                    EIO
+                })?;
+                underlying_dir.stat_child(&path).map_err(|e| {
+                    error!("statting {:?}: {e}", self.path);
+                    EIO
+                })?
+            }
+            _ => default_attr,
+        })
+    }
 }
 
 /// Data that an inode may represent
 ///
 /// Corresponds to jj's [`TreeValue`], but with some extra state
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum InodeData {
     Tree(TreeInode),
     File(FileInode),
     Symlink(SymlinkId),
     GitSubmodule(CommitId),
+    IgnoredTree(FxHashMap<RepoPathComponentBuf, usize>),
+    IgnoredFile,
 }
 
 impl InodeData {
@@ -1357,8 +1399,18 @@ impl InodeData {
         }
     }
 
-    fn to_tree_value(&self) -> TreeValue {
-        match self {
+    fn ty(&self) -> Option<FileType> {
+        Some(match self {
+            InodeData::Tree(_) | InodeData::IgnoredTree(_) => FileType::Directory,
+            InodeData::File(_) => FileType::RegularFile,
+            InodeData::Symlink(_) => FileType::Symlink,
+            InodeData::GitSubmodule(_) => FileType::Directory,
+            InodeData::IgnoredFile => return None,
+        })
+    }
+
+    fn to_tree_value(&self) -> Option<TreeValue> {
+        Some(match self {
             InodeData::Tree(x) => TreeValue::Tree(x.id.clone()),
             InodeData::File(x) => TreeValue::File {
                 id: x.id.clone(),
@@ -1367,7 +1419,8 @@ impl InodeData {
             },
             InodeData::Symlink(x) => TreeValue::Symlink(x.clone()),
             InodeData::GitSubmodule(x) => TreeValue::GitSubmodule(x.clone()),
-        }
+            InodeData::IgnoredTree(_) | InodeData::IgnoredFile => return None,
+        })
     }
 }
 
@@ -1415,7 +1468,11 @@ fn value_ty(value: &TreeValue) -> FileType {
     }
 }
 
-fn value_stat(value: &TreeValue) -> FileAttr {
+async fn value_stat(
+    store: &Arc<Store>,
+    path: &RepoPath,
+    value: &TreeValue,
+) -> BackendResult<FileAttr> {
     let ty = value_ty(value);
     let mut mode = 0o664;
     mode |= match value {
@@ -1425,20 +1482,20 @@ fn value_stat(value: &TreeValue) -> FileAttr {
         | TreeValue::Tree(_) => 0o111,
         _ => 0,
     };
-    FileAttr {
-        ino: 0,
-        size: 0,
-        blocks: 0,
-        atime: Timestamp::default(),
-        mtime: Timestamp::default(),
-        ctime: Timestamp::default(),
+    let mut size = 0;
+    if let TreeValue::File { id, .. } = value {
+        let meta = store.get_file_metadata(path, id).await?;
+        size = meta.size;
+    }
+    Ok(FileAttr {
         mode: ty.to_mode() | mode,
+        size,
         nlink: 1,
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
-        rdev: 0,
         blksize: 512,
-    }
+        ..Default::default()
+    })
 }
 
 #[derive(Clone)]
