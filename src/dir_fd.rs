@@ -6,7 +6,7 @@ use std::{
 };
 
 use fractal_fuse::{FileAttr, Timestamp};
-use libc::O_DIRECTORY;
+use libc::{O_DIRECTORY, O_PATH};
 
 pub struct DirFd(OwnedFd);
 
@@ -16,7 +16,7 @@ impl DirFd {
         let path = CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         unsafe {
-            let fd = libc::open(path.as_ptr().cast(), O_DIRECTORY);
+            let fd = libc::open(path.as_ptr().cast(), O_DIRECTORY | O_PATH);
             if fd == -1 {
                 return Err(io::Error::last_os_error());
             }
