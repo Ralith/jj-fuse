@@ -697,7 +697,8 @@ impl Shared {
         let Some(root_id) = commit.tree_ids().as_resolved().cloned() else {
             bail!("conflicted trees are not implemented");
         };
-        let root_inode = InodeState::new(RepoPathBuf::root(), TreeValue::Tree(root_id.clone()));
+        let root_inode =
+            InodeState::from_tree_value(RepoPathBuf::root(), TreeValue::Tree(root_id.clone()));
         let underlying_dir =
             DirFd::open(&underlying_dir_path).context("opening underlying directory")?;
         Ok(Self {
@@ -707,7 +708,7 @@ impl Shared {
                 // Dummy inode to reserve slot 0
                 (
                     0,
-                    InodeState::new(RepoPathBuf::root(), TreeValue::Tree(root_id)),
+                    InodeState::from_tree_value(RepoPathBuf::root(), TreeValue::Tree(root_id)),
                 ),
                 (FUSE_ROOT_ID as usize, root_inode),
             ])),
@@ -1032,6 +1033,7 @@ impl Shared {
             .as_tree()
             .map(|x| x.id.clone())
         else {
+            // TODO: Handle untracked dirs
             unreachable!()
         };
 
@@ -1044,12 +1046,34 @@ impl Shared {
                 error!("accessing parent directory {:?}: {:#}", parent.path, e);
                 EIO
             })?;
-        let value = parent_tree.value(name).ok_or(ENOENT)?;
-        let mut inode = InodeState::new(child_path, value.clone());
-        inode.parent = Some(InodeParent {
-            child_name: name.to_owned(),
-            parent: parent_ino as usize,
-        });
+        let inode = match parent_tree.value(name) {
+            Some(value) => {
+                let mut inode = InodeState::from_tree_value(child_path, value.clone());
+                inode.parent = Some(InodeParent {
+                    child_name: name.to_owned(),
+                    parent: parent_ino as usize,
+                });
+                inode
+            }
+            None => {
+                let child_fs_path = to_relative_fs_path(&child_path).map_err(|e| {
+                    error!("unrepresentable path {child_path:?}: {e}");
+                    EINVAL
+                })?;
+                let attr = self
+                    .underlying_dir
+                    .stat_child(&child_fs_path)
+                    .map_err(|e| {
+                        error!("stat {}: {e}", child_fs_path.display());
+                        e.raw_os_error().unwrap_or(EIO)
+                    })?;
+                let data = match attr.mode & FileType::Directory.to_mode() != 0 {
+                    true => InodeData::IgnoredTree(FxHashMap::default()),
+                    false => InodeData::IgnoredFile,
+                };
+                InodeState::new(child_path, data)
+            }
+        };
         let n = inodes.insert(inode);
         trace!("{:?} is inode {}", inodes.get(n).unwrap().path, n);
         inodes
@@ -1105,7 +1129,7 @@ impl Shared {
     ) -> FsResult<FileAttr> {
         let mut inodes = self.inodes.write().await;
         let full_path = inodes.get(parent as usize).unwrap().path.join(name);
-        let mut state = InodeState::new(full_path, value.clone());
+        let mut state = InodeState::from_tree_value(full_path, value.clone());
         state.parent = Some(InodeParent {
             child_name: name.to_owned(),
             parent: parent as usize,
@@ -1297,13 +1321,17 @@ struct InodeState {
 }
 
 impl InodeState {
-    fn new(path: RepoPathBuf, value: TreeValue) -> Self {
+    fn new(path: RepoPathBuf, state: InodeData) -> Self {
         Self {
             path,
-            mutable_state: RwLock::new(InodeData::from(value)),
+            mutable_state: RwLock::new(state),
             references: AtomicU64::new(1),
             parent: None,
         }
+    }
+
+    fn from_tree_value(path: RepoPathBuf, value: TreeValue) -> Self {
+        Self::new(path, InodeData::from(value))
     }
 
     async fn stat(&self, store: &Arc<Store>, underlying_dir: &DirFd) -> FsResult<FileAttr> {
