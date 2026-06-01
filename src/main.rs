@@ -70,8 +70,8 @@ fn run() -> anyhow::Result<()> {
     trace!("mounting");
     let session = fractal_fuse::Session::new(args.mountpoint, MountOptions::new().fs_name("jj"))
         .context("mounting")?
-        .queue_depth(128);
-    let notifier = session.notifier();
+        .with_queue_depth(128);
+    let notifier = session.shutdown_handle();
     ctrlc::set_handler(move || notifier.shutdown()).unwrap();
     trace!("running");
     let result = session.run(fs);
